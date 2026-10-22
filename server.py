@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """AVANTICO audit backend (Python 3.9+, stdlib only).  Run: python3 server.py  ->  http://localhost:8000
-Env: LEAD_WEBHOOK_URL (optional; receives each lead as JSON), PSI_KEY (optional Google PageSpeed API key), INTERNAL_TOKEN (enables /api/internal/*), RATE_LIMIT (audits per IP per hour, default 5), HOST, PORT,
+Env: LEAD_WEBHOOK_URL (optional; receives each lead as JSON), PSI_KEY (optional Google PageSpeed API key), INTERNAL_TOKEN (enables /api/internal/*), RATE_LIMIT (audits per IP per hour, default 5), PSI_BYPASS_CACHE (1 = ask Google for a fresh PageSpeed run each time), HOST, PORT,
 ALLOW_PRIVATE=1 (dev only: lets the crawler reach localhost/private IPs)."""
 import os, re, json, time, socket, hmac, ipaddress, secrets, threading
 import urllib.request, urllib.parse, urllib.error
@@ -152,6 +152,8 @@ def robots_blocked(txt):
 
 
 def get_psi(url):
+    if os.environ.get("PSI_BYPASS_CACHE") == "1":  # new URL for Google = new Lighthouse run (note: skips the site's own page cache too)
+        url += ("&" if "?" in url else "?") + "_psi=" + str(int(time.time()))
     q = {"url": url, "strategy": "mobile", "category": "performance"}
     if os.environ.get("PSI_KEY"): q["key"] = os.environ["PSI_KEY"]
     try:
@@ -160,7 +162,7 @@ def get_psi(url):
         return dict(score=round(j["categories"]["performance"]["score"] * 100),
                     lcp=a["largest-contentful-paint"]["displayValue"],
                     tbt=a["total-blocking-time"]["displayValue"],
-                    cls=a["cumulative-layout-shift"]["displayValue"])
+                    cls=a["cumulative-layout-shift"]["displayValue"], ran_at=j.get("fetchTime"))
     except urllib.error.HTTPError as e:
         try: msg = json.load(e)["error"]["message"]
         except Exception: msg = ""
@@ -332,7 +334,7 @@ def _run(A):
     A["report"] = dict(
         generated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), domain=urllib.parse.urlparse(hurl).hostname,
         scores=sc, overall=round(sum(vals) / len(vals)) if vals else None, findings=order, passed=A["passed"],
-        coverage=dict(pages_analysed=n, pages_discovered=len(cand) + 1, page_limit=MAX_PAGES, notes=notes,
+        coverage=dict(audit_id=A["token"][:8], duration=int(time.time() - t0), speed_ran_at=psi.get("ran_at"), pages_analysed=n, pages_discovered=len(cand) + 1, page_limit=MAX_PAGES, notes=notes,
                       speed=(f"LCP {psi['lcp']}, TBT {psi['tbt']}, CLS {psi['cls']}" if "score" in psi else None)))
     S["summary"] = "done"
     A.update(status="partial" if notes else "completed", message="Your report is ready", pages_discovered=len(cand) + 1)
@@ -397,7 +399,7 @@ class H(BaseHTTPRequestHandler):
         for k in [k for k, v in list(AUDITS.items()) if now - v["created"] > AUDIT_TTL]: AUDITS.pop(k, None)  # no old results kept around
         for k in [k for k, v in list(HITS.items()) if not v]: HITS.pop(k, None)
         token = secrets.token_urlsafe(16)
-        A = AUDITS[token] = dict(created=now, url=url, status="queued", message="Waiting to start…", steps={k: "waiting" for k in STEPS},
+        A = AUDITS[token] = dict(token=token, created=now, url=url, status="queued", message="Waiting to start…", steps={k: "waiting" for k in STEPS},
                                  pages_discovered=0, pages_analysed=0, customer=[], internal=[], passed=[], report=None)
         lead = dict(name=name, email=email, url=url, consent=True, at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         threading.Thread(target=deliver_lead, args=(lead,), daemon=True).start()
