@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """AVANTICO audit backend (Python 3.9+, stdlib only).  Run: python3 server.py  ->  http://localhost:8000
-Env: LEAD_WEBHOOK_URL (optional; receives each lead as JSON), PSI_KEY (optional Google PageSpeed API key), INTERNAL_TOKEN (enables /api/internal/*), HOST, PORT,
+Env: LEAD_WEBHOOK_URL (optional; receives each lead as JSON), PSI_KEY (optional Google PageSpeed API key), INTERNAL_TOKEN (enables /api/internal/*), RATE_LIMIT (audits per IP per hour, default 5), HOST, PORT,
 ALLOW_PRIVATE=1 (dev only: lets the crawler reach localhost/private IPs)."""
 import os, re, json, time, socket, hmac, ipaddress, secrets, threading
 import urllib.request, urllib.parse, urllib.error
@@ -14,6 +14,8 @@ CTA = ("contact", "get started", "book", "quote", "enquir", "inquir", "demo", "c
 W = {"high": 15, "medium": 8, "low": 3, "info": 0}
 STEPS = ("connect", "seo", "geo", "journey", "speed", "summary")
 ALLOW_PRIVATE = os.environ.get("ALLOW_PRIVATE") == "1"
+RATE_LIMIT = int(os.environ.get("RATE_LIMIT", 5))
+AUDIT_TTL = 2 * 3600  # finished or abandoned audits are forgotten after 2 hours
 AUDITS, HITS = {}, {}
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -153,13 +155,19 @@ def get_psi(url):
     q = {"url": url, "strategy": "mobile", "category": "performance"}
     if os.environ.get("PSI_KEY"): q["key"] = os.environ["PSI_KEY"]
     try:
-        r = urllib.request.urlopen("https://www.googleapis.com/pagespeedonline/v5/runPagespeed?" + urllib.parse.urlencode(q), timeout=70)
+        r = urllib.request.urlopen("https://www.googleapis.com/pagespeedonline/v5/runPagespeed?" + urllib.parse.urlencode(q), timeout=90)
         j = json.load(r)["lighthouseResult"]; a = j["audits"]
         return dict(score=round(j["categories"]["performance"]["score"] * 100),
                     lcp=a["largest-contentful-paint"]["displayValue"],
                     tbt=a["total-blocking-time"]["displayValue"],
                     cls=a["cumulative-layout-shift"]["displayValue"])
+    except urllib.error.HTTPError as e:
+        try: msg = json.load(e)["error"]["message"]
+        except Exception: msg = ""
+        print("PSI error", e.code, msg[:300], flush=True)  # full reason is in the host's logs
+        return {"error": f"HTTP {e.code}"}
     except Exception as e:
+        print("PSI error", type(e).__name__, flush=True)
         return {"error": type(e).__name__}
 
 
@@ -301,7 +309,7 @@ def _run(A):
     # Speed
     slow = pg(lambda d: d["ms"] > 1500)
     chk("speed", slow, "medium", "Slow server response", "took longer than 1.5 seconds to deliver the HTML", "Slow responses delay everything that follows.", "Pages respond quickly")
-    th.join(max(1, 75 - (time.time() - t0)))
+    th.join(max(1, 100 - (time.time() - t0)))
     speed = None
     if "score" in psi:
         speed = psi["score"]
@@ -311,7 +319,7 @@ def _run(A):
         S["speed"] = "done"
     else:
         S["speed"] = "unavailable"
-        notes.append("PageSpeed data was unavailable for this run" + (f" ({psi['error']})" if psi.get("error") else "") + "; no PageSpeed score is shown.")
+        notes.append("PageSpeed data was unavailable for this run" + (f" ({psi['error']})" if psi.get("error") else " (the request timed out)") + "; no PageSpeed score is shown.")
 
     # Summary
     S["summary"] = "running"
@@ -375,7 +383,7 @@ class H(BaseHTTPRequestHandler):
         if s.path != "/api/audits": return s.send(404, {"error": "not found"})
         ip, now = (s.headers.get("X-Nf-Client-Connection-Ip") or s.headers.get("X-Forwarded-For", "").split(",")[0].strip() or s.client_address[0]), time.time()
         HITS[ip] = [x for x in HITS.get(ip, []) if now - x < 3600]
-        if len(HITS[ip]) >= 5: return s.send(429, {"error": "Too many requests. Please try again later."})
+        if len(HITS[ip]) >= RATE_LIMIT: return s.send(429, {"error": "Too many requests. Please try again later."})
         try: d = json.loads(s.rfile.read(min(int(s.headers.get("Content-Length", 0)), 10000)))
         except Exception: return s.send(400, {"error": "Invalid request."})
         if d.get("hp"): return s.send(200, {"token": secrets.token_urlsafe(16)})  # honeypot
@@ -386,8 +394,10 @@ class H(BaseHTTPRequestHandler):
         try: check(url)
         except Exception: return s.send(400, {"error": "Please enter a valid, public website address."})
         HITS[ip].append(now)
+        for k in [k for k, v in list(AUDITS.items()) if now - v["created"] > AUDIT_TTL]: AUDITS.pop(k, None)  # no old results kept around
+        for k in [k for k, v in list(HITS.items()) if not v]: HITS.pop(k, None)
         token = secrets.token_urlsafe(16)
-        A = AUDITS[token] = dict(url=url, status="queued", message="Waiting to start…", steps={k: "waiting" for k in STEPS},
+        A = AUDITS[token] = dict(created=now, url=url, status="queued", message="Waiting to start…", steps={k: "waiting" for k in STEPS},
                                  pages_discovered=0, pages_analysed=0, customer=[], internal=[], passed=[], report=None)
         lead = dict(name=name, email=email, url=url, consent=True, at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         threading.Thread(target=deliver_lead, args=(lead,), daemon=True).start()
