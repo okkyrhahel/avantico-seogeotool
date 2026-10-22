@@ -1,0 +1,2 @@
+# Ganti NAMA-SERVICE dengan nama service Anda di Render
+/api/*  https://NAMA-SERVICE.onrender.com/api/:splat  200!
