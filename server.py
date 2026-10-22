@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""AVANTICO audit backend (Python 3.9+, stdlib only).  Run: python3 server.py  ->  http://localhost:8000
-Env: LEAD_WEBHOOK_URL (optional; receives each lead as JSON), PSI_KEY (optional Google PageSpeed API key), INTERNAL_TOKEN (enables /api/internal/*), RATE_LIMIT (audits per IP per hour, default 5), PSI_BYPASS_CACHE (1 = ask Google for a fresh PageSpeed run each time), HOST, PORT,
+"""Website audit backend (Python 3.9+, stdlib only).  Run: python3 server.py  ->  http://localhost:8000
+Env: LEAD_WEBHOOK_URL (optional; receives each lead as JSON), PSI_KEY (optional Google PageSpeed API key), INTERNAL_TOKEN (enables /api/internal/*), HOST, PORT,
 ALLOW_PRIVATE=1 (dev only: lets the crawler reach localhost/private IPs)."""
 import os, re, json, time, socket, hmac, ipaddress, secrets, threading
 import urllib.request, urllib.parse, urllib.error
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-MAX_PAGES, TIMEOUT, MAX_BYTES, BUDGET = 12, 8, 1_500_000, 60
-UA = "AVANTICO-AuditBot/1.0"
+MAX_PAGES, TIMEOUT, MAX_BYTES, BUDGET = 1, 8, 1_500_000, 60  # One detailed homepage audit; avoids averaging away weak pages
+UA = "SiteAuditBot/1.0"
 AI_BOTS = ["GPTBot", "ClaudeBot", "PerplexityBot", "Google-Extended", "CCBot"]
-CTA = ("contact", "get started", "book", "quote", "enquir", "inquir", "demo", "call", "consult", "hubungi", "konsultasi")
+CTA = (
+    # English
+    "contact", "get started", "book", "quote", "enquir", "inquir", "demo", "call", "consult", "appointment", "schedule",
+    # German
+    "kontakt", "kontaktieren", "termin vereinbaren", "termin buchen", "beratung buchen", "beratung vereinbaren",
+    "jetzt anfragen", "anfrage senden", "angebot anfordern", "offerte anfordern", "rückruf", "rueckruf",
+    # French / Italian / Indonesian
+    "prendre rendez-vous", "demander un devis", "nous contacter", "contattaci", "prenota", "hubungi", "konsultasi", "buat janji"
+)
 W = {"high": 15, "medium": 8, "low": 3, "info": 0}
 STEPS = ("connect", "seo", "geo", "journey", "speed", "summary")
 ALLOW_PRIVATE = os.environ.get("ALLOW_PRIVATE") == "1"
-RATE_LIMIT = int(os.environ.get("RATE_LIMIT", 5))
-AUDIT_TTL = 2 * 3600  # finished or abandoned audits are forgotten after 2 hours
 AUDITS, HITS = {}, {}
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -65,8 +71,8 @@ def tf(url, method="GET"):
 class P(HTMLParser):
     def __init__(s):
         super().__init__()
-        s.d = dict(title="", meta={}, h=[], canon=None, noalt=0, links=[], atext=[], ld=[],
-                   lang=None, viewport=False, forms=0, words=0)
+        s.d = dict(title="", meta={}, h=[], canon=None, noalt=0, links=[], atext=[], buttons=[], inputs=[], ld=[],
+                   lang=None, viewport=False, forms=0, words=0, body_text="")
         s.cap, s.buf, s.skip = None, "", False
 
     def handle_starttag(s, tag, a):
@@ -85,10 +91,16 @@ class P(HTMLParser):
             d["noalt"] += 1
         elif tag == "form":
             d["forms"] += 1
+        elif tag == "input":
+            d["inputs"].append({"type": (a.get("type") or "text").lower(), "name": a.get("name", ""),
+                                "id": a.get("id", ""), "aria": a.get("aria-label", ""),
+                                "required": "required" in a, "placeholder": a.get("placeholder", "")})
         elif tag == "a" and a.get("href"):
             d["links"].append(a["href"]); s.cap, s.buf = "a", ""
-        elif tag in ("title", "h1", "h2", "h3"):
+        elif tag in ("button", "title", "h1", "h2", "h3"):
             s.cap, s.buf = tag, ""
+            if tag == "button" and a.get("aria-label"):
+                d["buttons"].append(a.get("aria-label", "").lower())
         elif tag in ("script", "style"):
             s.skip = True
             if "ld+json" in (a.get("type") or ""):
@@ -103,6 +115,7 @@ class P(HTMLParser):
             if c == "title": d["title"] = t
             elif c == "ld": d["ld"].append(s.buf)
             elif c == "a": d["atext"].append(t.lower())
+            elif c == "button": d["buttons"].append(t.lower())
             else: d["h"].append((c, t))
             s.cap = None
 
@@ -111,6 +124,7 @@ class P(HTMLParser):
             s.buf += x
         if not s.skip and s.cap != "ld":
             s.d["words"] += len(x.split())
+            s.d["body_text"] += " " + x
 
 
 def parse(r):
@@ -135,6 +149,25 @@ def ld_types(blobs):
     return {str(x).lower() for x in out}, bad
 
 
+
+def ld_entities(blobs):
+    """Return basic Organization/LocalBusiness names and URLs for consistency checks."""
+    found = []
+    def walk(o):
+        if isinstance(o, list):
+            for item in o: walk(item)
+        elif isinstance(o, dict):
+            typ = o.get("@type", [])
+            types = [typ] if isinstance(typ, str) else typ if isinstance(typ, list) else []
+            if any(str(t).lower() in ("organization", "localbusiness", "professionalservice", "medicalbusiness") for t in types):
+                found.append({"name": str(o.get("name", "")).strip(), "url": str(o.get("url", "")).strip()})
+            for value in o.values(): walk(value)
+    for blob in blobs:
+        try: walk(json.loads(blob))
+        except Exception: pass
+    return found
+
+
 def robots_blocked(txt):
     agents, rules, blocked = [], False, set()
     for line in (txt or "").splitlines():
@@ -152,24 +185,21 @@ def robots_blocked(txt):
 
 
 def get_psi(url):
-    if os.environ.get("PSI_BYPASS_CACHE") == "1":  # new URL for Google = new Lighthouse run (note: skips the site's own page cache too)
-        url += ("&" if "?" in url else "?") + "_psi=" + str(int(time.time()))
-    q = {"url": url, "strategy": "mobile", "category": "performance"}
-    if os.environ.get("PSI_KEY"): q["key"] = os.environ["PSI_KEY"]
+    q = [("url", url), ("strategy", "mobile"), ("category", "performance"), ("category", "seo")]
+    if os.environ.get("PSI_KEY"): q.append(("key", os.environ["PSI_KEY"]))
     try:
-        r = urllib.request.urlopen("https://www.googleapis.com/pagespeedonline/v5/runPagespeed?" + urllib.parse.urlencode(q), timeout=90)
+        r = urllib.request.urlopen("https://www.googleapis.com/pagespeedonline/v5/runPagespeed?" + urllib.parse.urlencode(q), timeout=70)
         j = json.load(r)["lighthouseResult"]; a = j["audits"]
-        return dict(score=round(j["categories"]["performance"]["score"] * 100),
-                    lcp=a["largest-contentful-paint"]["displayValue"],
-                    tbt=a["total-blocking-time"]["displayValue"],
-                    cls=a["cumulative-layout-shift"]["displayValue"], ran_at=j.get("fetchTime"))
+        categories = j.get("categories", {})
+        return dict(score=round(categories["performance"]["score"] * 100),
+                    lighthouse_seo=round(categories["seo"]["score"] * 100) if categories.get("seo", {}).get("score") is not None else None,
+                    lcp=a.get("largest-contentful-paint", {}).get("displayValue", "Unavailable"),
+                    tbt=a.get("total-blocking-time", {}).get("displayValue", "Unavailable"),
+                    cls=a.get("cumulative-layout-shift", {}).get("displayValue", "Unavailable"))
     except urllib.error.HTTPError as e:
-        try: msg = json.load(e)["error"]["message"]
-        except Exception: msg = ""
-        print("PSI error", e.code, msg[:300], flush=True)  # full reason is in the host's logs
+        # Preserve the HTTP status (especially 429 quota/rate-limit responses) for transparent reporting.
         return {"error": f"HTTP {e.code}"}
     except Exception as e:
-        print("PSI error", type(e).__name__, flush=True)
         return {"error": type(e).__name__}
 
 
@@ -193,6 +223,8 @@ def _run(A):
     if home["status"] >= 400 or "html" not in home["ctype"].lower():
         raise RuntimeError(f"homepage status {home['status']}")
     S["connect"] = "done"; hurl = home["url"]
+    # Use the final redirected homepage as the canonical audit origin for robots/sitemap and links.
+    fu = urllib.parse.urlparse(hurl); origin = f"{fu.scheme}://{fu.netloc}"
     psi = {}; S["speed"] = "running"
     th = threading.Thread(target=lambda: psi.update(get_psi(hurl)), daemon=True); th.start()
 
@@ -216,8 +248,10 @@ def _run(A):
         if p.scheme in ("http", "https") and host(x) == host(hurl) and not ASSET.search(p.path) \
                 and x.rstrip("/") != hurl.rstrip("/") and x not in cand:
             cand.append(x)
-    cand = cand[:MAX_PAGES - 1]
-    A.update(status="analysing", pages_discovered=len(cand) + 1, pages_analysed=1, message="Analysing pages…")
+    # This version deliberately scores one page (the final homepage URL) in depth.
+    # We still inspect sitemap availability, but do not mix other pages into this page score.
+    cand = []
+    A.update(status="analysing", pages_discovered=1, pages_analysed=1, message="Auditing the homepage in detail…")
     S["seo"] = "running"; skipped = 0
     for x in cand:
         if time.time() - t0 > BUDGET:
@@ -228,8 +262,8 @@ def _run(A):
         else:
             skipped += 1
         A["pages_analysed"] = len(pages)
-    if skipped: notes.append(f"{skipped} discovered page(s) could not be analysed (errors or non-HTML responses).")
     n = len(pages)
+    notes.append("This report scores the final homepage URL only. Other pages are not included in the score.")
 
     def add(cat, sev, title, what, why, urls=(), ev=""):
         A["internal"].append(dict(cat=cat, sev=sev, title=title, what=what, why=why, urls=list(urls), evidence=ev))
@@ -253,8 +287,12 @@ def _run(A):
         if t(d): titles.setdefault(t(d).lower(), []).append(x)
     chk("seo", [x for v in titles.values() if len(v) > 1 for x in v], "medium", "Duplicate page titles", "share a title with another page", "Distinct titles help people and search engines tell pages apart.", "No duplicate titles found")
     chk("seo", pg(lambda d: not md(d)), "medium", "Missing meta descriptions", "have no meta description", "The description is often used as the summary under a search result.", "All analysed pages have a meta description")
-    chk("seo", pg(lambda d: not h1(d)), "medium", "Pages without a main heading (H1)", "have no H1", "A clear H1 tells visitors and crawlers what the page is about.", "Every analysed page has an H1")
-    chk("seo", pg(lambda d: len(h1(d)) > 1), "low", "Multiple H1 headings", "have more than one H1", "One main heading per page keeps the structure unambiguous.", "No page has multiple H1s")
+    chk("seo", pg(lambda d: not h1(d)), "medium", "Pages without a main heading (H1)", "have no H1", "A clear H1 tells visitors and crawlers what the page is about.", "The homepage has an H1")
+    chk("seo", pg(lambda d: len(h1(d)) > 1), "low", "Multiple H1 headings", "have more than one H1", "Multiple main headings are not automatically a ranking penalty, but may weaken the page's content hierarchy.", "No multiple-H1 issue detected")
+    chk("seo", pg(lambda d: not any(x[0] == "h2" for x in d["h"])), "medium", "No H2 subheadings", "have no H2 subheadings", "Subheadings can make long content easier to scan and help communicate topic structure.", "H2 subheadings are present")
+    chk("seo", pg(lambda d: d["words"] < 250), "medium", "Limited visible text content", "contain fewer than 250 extracted words", "A homepage with very little extractable text may not explain its offer, expertise, and relevance clearly. Word count alone does not determine quality.", "The homepage contains at least 250 extracted words")
+    chk("seo", pg(lambda d: bool(md(d)) and len(md(d)) < 70), "low", "Very short meta description", "have a meta description shorter than 70 characters", "A very short description may miss an opportunity to explain the page's value in search snippets.", "Meta description length is not obviously short")
+    chk("seo", pg(lambda d: bool(md(d)) and len(md(d)) > 170), "low", "Very long meta description", "have a meta description longer than 170 characters", "Long descriptions may be truncated in search snippets; search engines can also choose their own snippet.", "Meta description length is not obviously long")
     chk("seo", pg(lambda d: "noindex" in d["meta"].get("robots", "").lower()), "high", "Pages set to 'noindex'", "tell search engines not to index them", "Pages marked noindex will not appear in search results.", "No analysed page is blocked from indexing")
     chk("seo", pg(lambda d: not d["canon"]), "low", "Missing canonical links", "have no canonical link", "Canonical links help avoid duplicate-content confusion.", "Canonical links are present")
     chk("seo", pg(lambda d: d["noalt"] > 0), "low", "Images without an alt attribute", "contain images with no alt attribute", "Alternative text supports accessibility and gives images context.", "Images have alt attributes")
@@ -286,15 +324,40 @@ def _run(A):
     if bots: add("geo", "medium", "Some AI crawlers are blocked", f"robots.txt blocks: {', '.join(bots)}.", "Blocked crawlers cannot read your content for those AI products. This may be intentional.")
     else: ok("geo", "No major AI crawler is blocked in robots.txt")
     ll = tf(origin + "/llms.txt")
-    if ll and ll["status"] == 200 and "html" not in ll["ctype"].lower(): ok("geo", "llms.txt file found")
-    else: add("geo", "low", "No llms.txt file", "No /llms.txt file was found.", "It is an emerging convention for describing a site to AI tools; it is not a confirmed ranking factor.")
+    if ll and ll["status"] == 200 and "html" not in ll["ctype"].lower():
+        ll_text = ll["body"][:50000].lower()
+        # A file's existence is not enough: require meaningful overlap with the actual homepage.
+        home_tokens = set(re.findall(r"[a-zäöüà-ÿ0-9]{4,}", (hd.get("title", "") + " " + hd.get("body_text", "")).lower()))
+        ll_tokens = set(re.findall(r"[a-zäöüà-ÿ0-9]{4,}", ll_text))
+        overlap = len(home_tokens & ll_tokens)
+        domain_token = urllib.parse.urlparse(hurl).hostname.lower().replace("www.", "").split(".")[0]
+        brand_match = bool(domain_token and domain_token in ll_text)
+        overlap_ratio = overlap / max(1, len(ll_tokens))
+        if len(ll_text.strip()) >= 80 and (brand_match or (overlap >= 5 and overlap_ratio >= 0.08)):
+            ok("geo", "llms.txt found with basic relevance signals")
+        else:
+            add("geo", "medium", "llms.txt may not describe this website", "A file exists, but automated checks found little evidence that its contents match the homepage identity or topics.", "An irrelevant or outdated AI guidance file can misrepresent the business. This check compares text signals only and cannot verify every claim.", [hurl], "llms.txt token overlap=" + str(overlap) + "; domain token match=" + str(brand_match))
+    else:
+        add("geo", "low", "No llms.txt file", "No readable /llms.txt file was found.", "llms.txt is an emerging convention, not a confirmed ranking factor. Its absence is not by itself proof of poor AI visibility.", [hurl])
     types = {}
     for x, d in pages.items(): types[x] = ld_types(d["ld"])
     chk("geo", pg(lambda d: not d["ld"]), "medium", "Pages without structured data", "have no JSON-LD structured data", "Structured data states facts about a page in a machine-readable way.", "Structured data is present on all analysed pages")
     chk("geo", [x for x, (_, b) in types.items() if b], "low", "Invalid structured data", "contain JSON-LD that cannot be parsed", "Broken structured data is ignored by search and AI systems.", "Structured data parses correctly")
-    if any("organization" in t_ or "business" in t_ for t_ in types[hurl][0]): ok("geo", "Organisation/business details are declared in structured data")
-    else: add("geo", "medium", "No organisation details in structured data", "The homepage does not declare an Organization or LocalBusiness entity.", "Explicit entity details help systems identify who you are and what you offer.", [hurl])
-    chk("geo", pg(lambda d: d["words"] < 150), "medium", "Pages with very little text", "contain fewer than 150 words", "Thin pages give search and AI systems little to understand or quote.", "Analysed pages have substantial text")
+    if any("organization" in t_ or "business" in t_ for t_ in types[hurl][0]):
+        entities = ld_entities(hd["ld"])
+        domain_token = urllib.parse.urlparse(hurl).hostname.lower().replace("www.", "").split(".")[0]
+        page_identity = (hd.get("title", "") + " " + hd.get("body_text", "")).lower()
+        named_entities = [e for e in entities if e.get("name")]
+        mismatched = [e for e in named_entities if e["name"].lower() not in page_identity and domain_token not in e["name"].lower() and not any(tok in e["name"].lower() for tok in re.findall(r"[a-z0-9]{5,}", domain_token))]
+        if mismatched:
+            add("geo", "medium", "Structured business identity may not match the page", "Organisation/business structured data contains a name that could not be matched to the homepage text or domain.", "Incorrect entity information can confuse systems about which business the page represents. This is a text-based warning, not a definitive validation.", [hurl], json.dumps(mismatched[:3], ensure_ascii=False))
+        else:
+            ok("geo", "Organisation/business details are declared and pass a basic identity check")
+    else:
+        add("geo", "medium", "No organisation details in structured data", "The homepage does not declare an Organization or LocalBusiness entity.", "Explicit entity details can help systems identify who you are and what you offer, but structured data alone does not guarantee AI visibility.", [hurl])
+    chk("geo", pg(lambda d: d["words"] < 250), "medium", "Limited extractable content", "contain fewer than 250 extracted words", "Automated text extraction found limited content to interpret or quote. This does not assess factual accuracy, expertise, or whether AI systems will cite the page.", "The homepage has a reasonable amount of extractable text")
+    # Presence is not quality: flag empty/placeholder-like headings and content with little structure.
+    chk("geo", pg(lambda d: len([x for x in d["h"] if x[0] in ("h1", "h2", "h3") and len(x[1].strip()) >= 4]) < 2), "low", "Limited descriptive heading structure", "have fewer than two descriptive H1/H2/H3 headings", "Clear headings help machines and people identify the main topics, but do not prove factual quality or AI-answer visibility.", "Multiple descriptive headings are present")
     S["geo"] = "done"
 
     # Enquiry journey
@@ -302,8 +365,15 @@ def _run(A):
     hl = [h.lower() for h in hd["links"]]
     if any(h.startswith(("mailto:", "tel:")) or "wa.me" in h or "contact" in h or "kontak" in h for h in hl): ok("journey", "A contact route is linked from the homepage")
     else: add("journey", "high", "No clear contact route on the homepage", "The homepage has no email, phone, WhatsApp or contact-page link.", "Visitors who want to enquire need an obvious way to reach you.", [hurl])
-    if any(c in a for a in hd["atext"] for c in CTA): ok("journey", "The homepage has a call-to-action link")
-    else: add("journey", "medium", "No call-to-action link on the homepage", "No link text such as 'contact', 'get a quote' or 'book' was found on the homepage.", "A clear next step helps visitors act.", [hurl])
+    cta_texts = hd["atext"] + hd.get("buttons", [])
+    if any(c in a for a in cta_texts for c in CTA):
+        ok("journey", "A recognised CTA label was found in a link or button")
+    else:
+        add("journey", "medium", "No recognised call-to-action label", "No recognised CTA phrase was found in extracted link or button text.", "A clear next step helps visitors act. Detection covers common English, German, French, Italian and Indonesian phrases, but custom wording or text rendered only by JavaScript may be missed.", [hurl])
+    if any(len(a.strip()) >= 5 for a in cta_texts):
+        ok("journey", "Some links or buttons have descriptive labels")
+    else:
+        add("journey", "low", "Limited descriptive link/button labels", "No link or button with a descriptive text label was extracted.", "Descriptive labels help visitors understand the next action and improve accessibility. This does not assess visual prominence or usability.", [hurl])
     if sum(d["forms"] for d in pages.values()): ok("journey", "An enquiry form was found")
     else: add("journey", "medium", "No form found on analysed pages", f"None of the {n} analysed pages contains a form.", "Forms are an easy way for visitors to enquire, though not the only one.")
     S["journey"] = "done"
@@ -311,7 +381,7 @@ def _run(A):
     # Speed
     slow = pg(lambda d: d["ms"] > 1500)
     chk("speed", slow, "medium", "Slow server response", "took longer than 1.5 seconds to deliver the HTML", "Slow responses delay everything that follows.", "Pages respond quickly")
-    th.join(max(1, 100 - (time.time() - t0)))
+    th.join(max(1, 75 - (time.time() - t0)))
     speed = None
     if "score" in psi:
         speed = psi["score"]
@@ -321,7 +391,14 @@ def _run(A):
         S["speed"] = "done"
     else:
         S["speed"] = "unavailable"
-        notes.append("PageSpeed data was unavailable for this run" + (f" ({psi['error']})" if psi.get("error") else " (the request timed out)") + "; no PageSpeed score is shown.")
+        notes.append("PageSpeed data was unavailable for this run" + (f" ({psi['error']})" if psi.get("error") else "") + "; no PageSpeed score is shown.")
+
+    # Use the SEO category returned by the same PageSpeed Insights API request as a cross-check.
+    # It is not a separate API and does not replace the crawler's SEO checks.
+    lighthouse_seo = psi.get("lighthouse_seo")
+    if lighthouse_seo is not None and lighthouse_seo < 80:
+        sev = "high" if lighthouse_seo < 50 else "medium"
+        add("seo", sev, "Lighthouse SEO checks found issues", f"Google Lighthouse returned an SEO category score of {lighthouse_seo}/100 for the homepage.", "This is a supplementary set of technical SEO checks. Review it alongside the individual findings; it does not measure content quality or rankings.", [hurl], f"Lighthouse SEO score={lighthouse_seo}")
 
     # Summary
     S["summary"] = "running"
@@ -331,13 +408,26 @@ def _run(A):
     sc["speed"] = speed
     vals = [v for v in sc.values() if v is not None]
     order = sorted(A["customer"], key=lambda x: -W[x["sev"]])
+    # Missing PSI is a coverage failure, not a passing score. Keep the numeric score provisional.
+    speed_missing = speed is None
+    assessment = "incomplete" if speed_missing else "complete"
+    limitations = [
+        "GEO score measures technical/content readiness signals only; it does not measure actual visibility or citations in AI-generated answers.",
+        "Automated checks cannot fully assess factual accuracy, content expertise, visual design, keyboard/screen-reader usability, conversion rate, or real visitor behaviour.",
+        "PageSpeed is measured for the homepage on mobile only. It is not a site-wide performance score."
+    ]
+    psi_seo = psi.get("lighthouse_seo")
+    if psi_seo is not None:
+        notes.append(f"PageSpeed/Lighthouse SEO category score: {psi_seo}/100. This is a supplementary signal, not a replacement for the internal SEO audit.")
     A["report"] = dict(
         generated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), domain=urllib.parse.urlparse(hurl).hostname,
-        scores=sc, overall=round(sum(vals) / len(vals)) if vals else None, findings=order, passed=A["passed"],
-        coverage=dict(audit_id=A["token"][:8], duration=int(time.time() - t0), speed_ran_at=psi.get("ran_at"), pages_analysed=n, pages_discovered=len(cand) + 1, page_limit=MAX_PAGES, notes=notes,
-                      speed=(f"LCP {psi['lcp']}, TBT {psi['tbt']}, CLS {psi['cls']}" if "score" in psi else None)))
+        final_url=hurl, scores=sc, overall=round(sum(vals) / len(vals)) if vals else None, findings=order, passed=A["passed"],
+        assessment_status=assessment, limitations=limitations,
+        coverage=dict(pages_analysed=n, pages_discovered=1, page_limit=1, notes=notes,
+                      speed=(f"Performance {speed}/100; LCP {psi['lcp']}, TBT {psi['tbt']}, CLS {psi['cls']}" if "score" in psi else None),
+                      lighthouse_seo=psi_seo, speed_status="available" if not speed_missing else "unavailable"))
     S["summary"] = "done"
-    A.update(status="partial" if notes else "completed", message="Your report is ready", pages_discovered=len(cand) + 1)
+    A.update(status="partial" if speed_missing else "completed", message="Your report is ready" if not speed_missing else "Report ready, but PageSpeed data is missing", pages_discovered=1)
 
 
 # ---------- HTTP ----------
@@ -385,7 +475,7 @@ class H(BaseHTTPRequestHandler):
         if s.path != "/api/audits": return s.send(404, {"error": "not found"})
         ip, now = (s.headers.get("X-Nf-Client-Connection-Ip") or s.headers.get("X-Forwarded-For", "").split(",")[0].strip() or s.client_address[0]), time.time()
         HITS[ip] = [x for x in HITS.get(ip, []) if now - x < 3600]
-        if len(HITS[ip]) >= RATE_LIMIT: return s.send(429, {"error": "Too many requests. Please try again later."})
+        if len(HITS[ip]) >= 5: return s.send(429, {"error": "Too many requests. Please try again later."})
         try: d = json.loads(s.rfile.read(min(int(s.headers.get("Content-Length", 0)), 10000)))
         except Exception: return s.send(400, {"error": "Invalid request."})
         if d.get("hp"): return s.send(200, {"token": secrets.token_urlsafe(16)})  # honeypot
@@ -396,10 +486,8 @@ class H(BaseHTTPRequestHandler):
         try: check(url)
         except Exception: return s.send(400, {"error": "Please enter a valid, public website address."})
         HITS[ip].append(now)
-        for k in [k for k, v in list(AUDITS.items()) if now - v["created"] > AUDIT_TTL]: AUDITS.pop(k, None)  # no old results kept around
-        for k in [k for k, v in list(HITS.items()) if not v]: HITS.pop(k, None)
         token = secrets.token_urlsafe(16)
-        A = AUDITS[token] = dict(token=token, created=now, url=url, status="queued", message="Waiting to start…", steps={k: "waiting" for k in STEPS},
+        A = AUDITS[token] = dict(url=url, status="queued", message="Waiting to start…", steps={k: "waiting" for k in STEPS},
                                  pages_discovered=0, pages_analysed=0, customer=[], internal=[], passed=[], report=None)
         lead = dict(name=name, email=email, url=url, consent=True, at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         threading.Thread(target=deliver_lead, args=(lead,), daemon=True).start()
@@ -411,5 +499,5 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     host, port = os.environ.get("HOST", "127.0.0.1"), int(os.environ.get("PORT", 8000))
-    print(f"AVANTICO audit running on http://{host}:{port}")
+    print(f"Website audit running on http://{host}:{port}")
     ThreadingHTTPServer((host, port), H).serve_forever()
