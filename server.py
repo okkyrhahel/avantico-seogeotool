@@ -20,6 +20,8 @@ CTA = (
     "prendre rendez-vous", "demander un devis", "nous contacter", "contattaci", "prenota", "hubungi", "konsultasi", "buat janji"
 )
 W = {"high": 15, "medium": 8, "low": 3, "info": 0}
+# GEO has a separate weighting model because some readiness signals are more consequential.
+GEO_W = {"high": 20, "medium": 10, "low": 4, "info": 0}
 STEPS = ("connect", "seo", "geo", "journey", "speed", "summary")
 ALLOW_PRIVATE = os.environ.get("ALLOW_PRIVATE") == "1"
 AUDITS, HITS = {}, {}
@@ -318,46 +320,183 @@ def _run(A):
     else: ok("seo", "Homepage internal links checked are working")
     S["seo"] = "done"
 
-    # GEO
+    # GEO — assess access, machine-readable identity, and useful extractable content.
+    # These checks estimate technical/content readiness; they do not measure actual AI citations.
     S["geo"] = "running"
+
     bots = [b for b in AI_BOTS if b.lower() in blocked]
-    if bots: add("geo", "medium", "Some AI crawlers are blocked", f"robots.txt blocks: {', '.join(bots)}.", "Blocked crawlers cannot read your content for those AI products. This may be intentional.")
-    else: ok("geo", "No major AI crawler is blocked in robots.txt")
+    if bots:
+        add("geo", "medium", "Some AI crawlers are blocked",
+            f"robots.txt appears to block: {', '.join(bots)}.",
+            "Blocked crawlers may be unable to fetch public content for the related AI products. This may be intentional, and robots.txt does not control every form of reuse.")
+    else:
+        ok("geo", "No listed major AI crawler is explicitly blocked by the simple robots.txt check")
+
+    # llms.txt is optional and emerging: its absence is only a low-priority observation.
     ll = tf(origin + "/llms.txt")
     if ll and ll["status"] == 200 and "html" not in ll["ctype"].lower():
         ll_text = ll["body"][:50000].lower()
-        # A file's existence is not enough: require meaningful overlap with the actual homepage.
-        home_tokens = set(re.findall(r"[a-zäöüà-ÿ0-9]{4,}", (hd.get("title", "") + " " + hd.get("body_text", "")).lower()))
-        ll_tokens = set(re.findall(r"[a-zäöüà-ÿ0-9]{4,}", ll_text))
+        home_text = (hd.get("title", "") + " " + hd.get("body_text", "")).lower()
+        token_re = r"[a-zäöüà-ÿ0-9]{4,}"
+        home_tokens = set(re.findall(token_re, home_text))
+        ll_tokens = set(re.findall(token_re, ll_text))
         overlap = len(home_tokens & ll_tokens)
         domain_token = urllib.parse.urlparse(hurl).hostname.lower().replace("www.", "").split(".")[0]
         brand_match = bool(domain_token and domain_token in ll_text)
         overlap_ratio = overlap / max(1, len(ll_tokens))
         if len(ll_text.strip()) >= 80 and (brand_match or (overlap >= 5 and overlap_ratio >= 0.08)):
-            ok("geo", "llms.txt found with basic relevance signals")
+            ok("geo", "llms.txt contains basic signals relevant to the homepage")
         else:
-            add("geo", "medium", "llms.txt may not describe this website", "A file exists, but automated checks found little evidence that its contents match the homepage identity or topics.", "An irrelevant or outdated AI guidance file can misrepresent the business. This check compares text signals only and cannot verify every claim.", [hurl], "llms.txt token overlap=" + str(overlap) + "; domain token match=" + str(brand_match))
+            add("geo", "low", "llms.txt relevance could not be confirmed",
+                "A readable file exists, but automated text checks found limited overlap with the homepage identity or topics.",
+                "An inaccurate or outdated guidance file may confuse readers or systems. This heuristic cannot verify factual accuracy.", [hurl],
+                "llms.txt token overlap=" + str(overlap) + "; domain token match=" + str(brand_match))
     else:
-        add("geo", "low", "No llms.txt file", "No readable /llms.txt file was found.", "llms.txt is an emerging convention, not a confirmed ranking factor. Its absence is not by itself proof of poor AI visibility.", [hurl])
-    types = {}
-    for x, d in pages.items(): types[x] = ld_types(d["ld"])
-    chk("geo", pg(lambda d: not d["ld"]), "medium", "Pages without structured data", "have no JSON-LD structured data", "Structured data states facts about a page in a machine-readable way.", "Structured data is present on all analysed pages")
-    chk("geo", [x for x, (_, b) in types.items() if b], "low", "Invalid structured data", "contain JSON-LD that cannot be parsed", "Broken structured data is ignored by search and AI systems.", "Structured data parses correctly")
-    if any("organization" in t_ or "business" in t_ for t_ in types[hurl][0]):
-        entities = ld_entities(hd["ld"])
-        domain_token = urllib.parse.urlparse(hurl).hostname.lower().replace("www.", "").split(".")[0]
-        page_identity = (hd.get("title", "") + " " + hd.get("body_text", "")).lower()
-        named_entities = [e for e in entities if e.get("name")]
-        mismatched = [e for e in named_entities if e["name"].lower() not in page_identity and domain_token not in e["name"].lower() and not any(tok in e["name"].lower() for tok in re.findall(r"[a-z0-9]{5,}", domain_token))]
-        if mismatched:
-            add("geo", "medium", "Structured business identity may not match the page", "Organisation/business structured data contains a name that could not be matched to the homepage text or domain.", "Incorrect entity information can confuse systems about which business the page represents. This is a text-based warning, not a definitive validation.", [hurl], json.dumps(mismatched[:3], ensure_ascii=False))
+        add("geo", "low", "No readable llms.txt file detected",
+            "No readable /llms.txt file was found.",
+            "llms.txt is an optional emerging convention, not a universal requirement or a confirmed ranking factor. Its absence alone does not mean GEO readiness is poor.", [hurl])
+
+    types = {x: ld_types(d["ld"]) for x, d in pages.items()}
+    chk("geo", pg(lambda d: not d["ld"]), "medium", "No JSON-LD structured data detected",
+        "have no JSON-LD structured data in the HTML returned to the crawler",
+        "Structured data can make selected facts about a page easier for software to interpret, but it must be accurate and appropriate to the page.",
+        "JSON-LD structured data is present")
+    chk("geo", [x for x, (_, bad_count) in types.items() if bad_count], "medium",
+        "Some JSON-LD could not be parsed",
+        "contain one or more JSON-LD blocks that failed JSON parsing",
+        "Malformed blocks may be ignored by systems that rely on them. This check validates JSON syntax only, not schema.org rules or eligibility.",
+        "JSON-LD blocks passed basic JSON parsing")
+
+    entity_types = types[hurl][0]
+    business_types = {"organization", "localbusiness", "professionalservice", "medicalbusiness"}
+    business_entities = ld_entities(hd["ld"])
+    declared_business = any(t in business_types for t in entity_types)
+
+    if not declared_business:
+        add("geo", "medium", "Business identity is not explicit in structured data",
+            "No Organization or LocalBusiness-type entity was detected in the homepage JSON-LD.",
+            "A clear machine-readable business identity can help disambiguate who operates the website. This is a useful signal for business sites, but not every website needs a business entity.", [hurl])
+    else:
+        named_entities = [e for e in business_entities if e.get("name")]
+        if not named_entities:
+            add("geo", "medium", "Structured business entity has no readable name",
+                "A business-type schema was detected, but no non-empty name was extracted from it.",
+                "Without a clear name, the structured entity provides less useful identity information. The automated parser may miss some valid schema patterns.", [hurl])
         else:
-            ok("geo", "Organisation/business details are declared and pass a basic identity check")
+            page_identity = (hd.get("title", "") + " " + hd.get("body_text", "")).lower()
+            domain_token = urllib.parse.urlparse(hurl).hostname.lower().replace("www.", "").split(".")[0]
+            def norm_identity(value):
+                return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+            norm_page = norm_identity(page_identity)
+            norm_domain = norm_identity(domain_token)
+            mismatched = [
+                e for e in named_entities
+                if norm_identity(e["name"]) not in norm_page
+                and not (norm_domain and norm_domain in norm_identity(e["name"]))
+            ]
+            if mismatched:
+                add("geo", "medium", "Business identity may be inconsistent",
+                    "At least one structured business name could not be matched to the extracted homepage text or domain name.",
+                    "Conflicting business names can make it harder to associate the page with the correct entity. This is a heuristic warning, not proof of an error.", [hurl],
+                    json.dumps(mismatched[:3], ensure_ascii=False))
+            else:
+                ok("geo", "A business name in structured data broadly matches the homepage identity")
+
+        # Check useful fields on detected business entities, rather than only schema presence.
+        parsed_business = []
+        def collect_business(o):
+            if isinstance(o, list):
+                for item in o:
+                    collect_business(item)
+            elif isinstance(o, dict):
+                typ = o.get("@type", [])
+                type_list = [typ] if isinstance(typ, str) else typ if isinstance(typ, list) else []
+                if any(str(t).lower() in business_types for t in type_list):
+                    parsed_business.append(o)
+                for value in o.values():
+                    collect_business(value)
+        for blob in hd["ld"]:
+            try:
+                collect_business(json.loads(blob))
+            except Exception:
+                pass
+        if parsed_business:
+            missing_name = any(not str(o.get("name", "")).strip() for o in parsed_business)
+            missing_url = any(not str(o.get("url", "")).strip() for o in parsed_business)
+            missing_desc = any(not str(o.get("description", "")).strip() for o in parsed_business)
+            if missing_name:
+                # Avoid duplicating the same issue when the earlier name check already reported it.
+                if named_entities:
+                    add("geo", "medium", "Some business schema lacks a name",
+                        "At least one detected business entity is missing a name.",
+                        "Incomplete entity fields can reduce the usefulness of structured identity information.", [hurl])
+            elif missing_url or missing_desc:
+                fields = []
+                if missing_url: fields.append("url")
+                if missing_desc: fields.append("description")
+                add("geo", "low", "Business schema has limited descriptive fields",
+                    "At least one business entity is missing: " + " and/or ".join(fields) + ".",
+                    "A canonical URL and a concise, accurate description can provide useful context. These fields should reflect the visible website and are not a guarantee of AI visibility.", [hurl])
+            else:
+                ok("geo", "Business schema includes a name, URL and description")
+
+    # Assess visible content in bands; word count is only one signal, never a quality verdict.
+    words = hd.get("words", 0)
+    if words < 100:
+        add("geo", "high", "Very little extractable homepage content",
+            f"Only about {words} words were extracted from the homepage HTML.",
+            "Very limited text gives systems little explicit information to interpret, summarise or quote. JavaScript-rendered text may not be included in this scan.", [hurl])
+    elif words < 250:
+        add("geo", "medium", "Limited extractable homepage content",
+            f"About {words} words were extracted from the homepage HTML.",
+            "The page may not provide enough explicit context about the organisation, its offer and relevant details. Word count alone does not determine content quality.", [hurl])
     else:
-        add("geo", "medium", "No organisation details in structured data", "The homepage does not declare an Organization or LocalBusiness entity.", "Explicit entity details can help systems identify who you are and what you offer, but structured data alone does not guarantee AI visibility.", [hurl])
-    chk("geo", pg(lambda d: d["words"] < 250), "medium", "Limited extractable content", "contain fewer than 250 extracted words", "Automated text extraction found limited content to interpret or quote. This does not assess factual accuracy, expertise, or whether AI systems will cite the page.", "The homepage has a reasonable amount of extractable text")
-    # Presence is not quality: flag empty/placeholder-like headings and content with little structure.
-    chk("geo", pg(lambda d: len([x for x in d["h"] if x[0] in ("h1", "h2", "h3") and len(x[1].strip()) >= 4]) < 2), "low", "Limited descriptive heading structure", "have fewer than two descriptive H1/H2/H3 headings", "Clear headings help machines and people identify the main topics, but do not prove factual quality or AI-answer visibility.", "Multiple descriptive headings are present")
+        ok("geo", "Homepage contains a reasonable amount of extractable text (quantity only)")
+
+    # Heading usefulness: count descriptive headings and flag generic/empty heading structure.
+    headings = [x[1].strip() for x in hd["h"] if x[0] in ("h1", "h2", "h3") and len(x[1].strip()) >= 4]
+    generic_headings = {
+        "home", "welcome", "learn more", "read more", "about us", "our services",
+        "services", "contact us", "get started", "mehr erfahren", "willkommen",
+        "nos services", "en savoir plus"
+    }
+    descriptive_headings = [h for h in headings if re.sub(r"[^a-zäöüà-ÿ0-9 ]", "", h.lower()).strip() not in generic_headings]
+    if len(descriptive_headings) < 2:
+        add("geo", "low", "Limited descriptive heading structure",
+            f"Only {len(descriptive_headings)} clearly descriptive H1/H2/H3 headings were detected.",
+            "Descriptive headings help readers and systems identify the page's topics. This check cannot judge whether the content beneath each heading is accurate or useful.", [hurl])
+    else:
+        ok("geo", "Multiple descriptive headings provide topic structure")
+
+    # Check whether the homepage appears to explain its subject, rather than only presenting slogans.
+    title_and_headings = " ".join([hd.get("title", "")] + headings).strip()
+    meaningful_chars = len(re.sub(r"\s+", "", title_and_headings))
+    sentence_like = re.findall(r"[^.!?。！？]{35,}[.!?。！？]", hd.get("body_text", ""))
+    if meaningful_chars < 25 or len(sentence_like) < 2:
+        add("geo", "low", "Few explicit explanatory content signals",
+            "The extracted title/headings are very short or the page contains few sentence-like explanatory passages in the returned HTML.",
+            "AI-search systems need clear context to interpret a page. This is a rough text heuristic and may miss short-form, multilingual or JavaScript-rendered content.", [hurl])
+    else:
+        ok("geo", "Some explicit explanatory text is present (basic text heuristic)")
+
+    # A useful topical link can provide context, but it is not required for every homepage.
+    internal_paths = []
+    for href in hd.get("links", []):
+        absolute = urllib.parse.urljoin(hurl, href)
+        parsed_link = urllib.parse.urlparse(absolute)
+        if parsed_link.scheme in ("http", "https") and host(absolute) == host(hurl):
+            internal_paths.append(parsed_link.path.lower().strip("/"))
+    topic_link = any(
+        any(term in path.split("/") for term in ("about", "service", "services", "product", "products", "leistungen", "angebot", "ueber-uns", "über-uns"))
+        for path in internal_paths
+    )
+    if topic_link:
+        ok("geo", "Homepage links to at least one about, service or product page")
+    else:
+        add("geo", "low", "No obvious about, service or product link detected",
+            "No internal homepage link with a commonly recognised about/service/product path was detected.",
+            "Relevant internal pages can provide additional context about the business and its offer. Custom URL structures may not be recognised by this check.", [hurl])
+
     S["geo"] = "done"
 
     # Enquiry journey
@@ -404,7 +543,8 @@ def _run(A):
     S["summary"] = "running"
     sc = {}
     for c in ("seo", "geo", "journey"):
-        sc[c] = max(0, 100 - sum(W[x["sev"]] for x in A["customer"] if x["cat"] == c))
+        weights = GEO_W if c == "geo" else W
+        sc[c] = max(0, 100 - sum(weights[x["sev"]] for x in A["customer"] if x["cat"] == c))
     sc["speed"] = speed
     vals = [v for v in sc.values() if v is not None]
     order = sorted(A["customer"], key=lambda x: -W[x["sev"]])
