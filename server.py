@@ -59,6 +59,7 @@ def fetch(url, method="GET"):
         r = e
     body = b"" if method == "HEAD" else r.read(MAX_BYTES)
     return dict(status=r.code, url=r.geturl(), ctype=r.headers.get("content-type", ""),
+                headers={str(k).lower(): str(v) for k, v in r.headers.items()},
                 body=body.decode("utf-8", "replace"), ms=int((time.time() - t) * 1000))
 
 
@@ -73,8 +74,9 @@ def tf(url, method="GET"):
 class P(HTMLParser):
     def __init__(s):
         super().__init__()
-        s.d = dict(title="", meta={}, h=[], canon=None, noalt=0, links=[], atext=[], buttons=[], inputs=[], ld=[],
-                   lang=None, viewport=False, forms=0, words=0, body_text="")
+        s.d = dict(title="", meta={}, h=[], canon=None, noalt=0, images=[], links=[], atext=[], anchor_details=[],
+                   buttons=[], inputs=[], ld=[], lang=None, viewport=False, forms=0, words=0, body_text="",
+                   has_main=False, has_article=False, iframes=[], videos=0, paragraphs=0)
         s.cap, s.buf, s.skip = None, "", False
 
     def handle_starttag(s, tag, a):
@@ -89,8 +91,22 @@ class P(HTMLParser):
                 d["viewport"] = True
         elif tag == "link" and "canonical" in (a.get("rel") or "").lower():
             d["canon"] = a.get("href")
-        elif tag == "img" and "alt" not in a:
-            d["noalt"] += 1
+        elif tag == "img":
+            if "alt" not in a:
+                d["noalt"] += 1
+            d["images"].append({"src": a.get("src", ""), "alt": a.get("alt"),
+                                "width": a.get("width"), "height": a.get("height"),
+                                "loading": a.get("loading", "").lower()})
+        elif tag == "main":
+            d["has_main"] = True
+        elif tag == "article":
+            d["has_article"] = True
+        elif tag == "iframe":
+            d["iframes"].append({"src": a.get("src", ""), "title": a.get("title", "").strip()})
+        elif tag == "video":
+            d["videos"] += 1
+        elif tag == "p":
+            d["paragraphs"] += 1
         elif tag == "form":
             d["forms"] += 1
         elif tag == "input":
@@ -98,7 +114,10 @@ class P(HTMLParser):
                                 "id": a.get("id", ""), "aria": a.get("aria-label", ""),
                                 "required": "required" in a, "placeholder": a.get("placeholder", "")})
         elif tag == "a" and a.get("href"):
-            d["links"].append(a["href"]); s.cap, s.buf = "a", ""
+            d["links"].append(a["href"])
+            d["anchor_details"].append({"href": a["href"], "rel": a.get("rel", "").lower(),
+                                         "target": a.get("target", "").lower()})
+            s.cap, s.buf = "a", ""
         elif tag in ("button", "title", "h1", "h2", "h3"):
             s.cap, s.buf = tag, ""
             if tag == "button" and a.get("aria-label"):
@@ -317,7 +336,130 @@ def _run(A):
         r = tf(x, "HEAD")
         if r and r["status"] >= 400 and r["status"] not in (403, 405, 429): broken.append(x)
     if broken: add("seo", "high", "Broken links on the homepage", f"{len(broken)} of {min(15, len(internal))} internal homepage links checked returned an error.", "Broken links frustrate visitors and waste crawl budget.", broken)
-    else: ok("seo", "Homepage internal links checked are working")
+    elif internal: ok("seo", "Homepage internal links checked are working")
+    else: add("seo", "low", "Few or no internal links detected", "No crawlable internal links were extracted from the homepage.", "Internal links help visitors and crawlers discover related pages.", [hurl])
+
+    # Additional SEO checks based on the supplied checklist. No new external API is used.
+    # Header-based directives and transport/security signals.
+    home_headers = home.get("headers", {})
+    x_robots = home_headers.get("x-robots-tag", "").lower()
+    if "noindex" in x_robots:
+        add("seo", "high", "HTTP header sets noindex", "The homepage response includes an X-Robots-Tag header containing noindex.", "Search engines are instructed not to index the page even if the HTML itself does not contain a noindex directive.", [hurl], "X-Robots-Tag=" + x_robots)
+    elif x_robots:
+        ok("seo", "X-Robots-Tag header inspected (no noindex directive detected)")
+    else:
+        ok("seo", "No X-Robots-Tag header directive detected")
+
+    canon = (hd.get("canon") or "").strip()
+    if canon:
+        canon_url = urllib.parse.urljoin(hurl, canon)
+        cp = urllib.parse.urlparse(canon_url)
+        if cp.scheme not in ("http", "https") or host(canon_url) != host(hurl):
+            add("seo", "medium", "Canonical points to a different host or invalid URL", "The canonical target is not on the audited host or is not a normal HTTP(S) URL.", "An unexpected canonical target can consolidate search signals onto a different URL.", [hurl], "canonical=" + canon_url)
+        elif canon_url.rstrip("/") != hurl.rstrip("/"):
+            cr = tf(canon_url, "HEAD")
+            if cr and cr["status"] >= 400 and cr["status"] not in (403, 405, 429):
+                add("seo", "high", "Canonical target appears unavailable", f"The canonical target returned HTTP {cr['status']}.", "A canonical target that cannot be accessed may send conflicting indexing signals.", [hurl, canon_url], "canonical=" + canon_url)
+            else:
+                add("seo", "low", "Canonical is not self-referencing", "The homepage canonical points to a different URL.", "This may be intentional, but should be checked to ensure the preferred URL is correct.", [hurl, canon_url], "canonical=" + canon_url)
+        else:
+            ok("seo", "Homepage canonical is self-referencing")
+
+    if hurl.startswith("https://"):
+        mixed = [im.get("src", "") for im in hd.get("images", []) if im.get("src", "").startswith("http://")]
+        mixed += [href for href in hd.get("links", []) if href.startswith("http://") and urllib.parse.urlparse(href).netloc.lower() != urllib.parse.urlparse(hurl).netloc.lower()]
+        if mixed:
+            add("seo", "medium", "HTTP resources or links found on HTTPS page", f"{len(mixed)} extracted image/link URLs use HTTP rather than HTTPS.", "Insecure embedded resources can trigger mixed-content problems; external HTTP links should be reviewed separately.", [hurl], json.dumps(mixed[:10]))
+        else:
+            ok("seo", "No obvious HTTP image resources or external HTTP links detected")
+
+    title_text = t(hd)
+    h1_text = " ".join(x[1] for x in h1(hd)).strip()
+    desc_text = md(hd)
+    norm = lambda x: re.sub(r"[^a-z0-9]+", " ", (x or "").lower()).strip()
+    title_words = set(norm(title_text).split())
+    h1_words = set(norm(h1_text).split())
+    if title_text and h1_text and len(title_words & h1_words) == 0:
+        add("seo", "low", "Title and H1 topic may not align", "The homepage title and H1 share no words after basic normalization.", "The title and main heading should describe the same primary page topic. This simple language heuristic may misread brand-led or multilingual pages.", [hurl], "title=" + title_text + "; h1=" + h1_text)
+    elif title_text and h1_text:
+        ok("seo", "Title and H1 have some topical wording in common")
+
+    if desc_text and h1_text and len(set(norm(desc_text).split()) & h1_words) == 0:
+        add("seo", "low", "Meta description may not match the main heading", "The meta description and H1 share no words after basic normalization.", "A relevant description can help searchers understand what the page offers. This heuristic does not judge meaning or search intent accurately.", [hurl])
+    elif desc_text and h1_text:
+        ok("seo", "Meta description shares wording with the main heading")
+
+    # Open Graph / social metadata.
+    missing_og = [k for k in ("og:title", "og:description", "og:image") if not hd["meta"].get(k, "").strip()]
+    if missing_og:
+        add("seo", "low", "Some Open Graph tags are missing", "The homepage is missing: " + ", ".join(missing_og) + ".", "Social metadata can improve how links are presented when shared; it is not a direct guarantee of higher search rankings.", [hurl])
+    else:
+        ok("seo", "Core Open Graph tags are present")
+    if not hd["meta"].get("twitter:card", "").strip():
+        add("seo", "low", "Twitter card metadata not detected", "No twitter:card meta tag was found.", "A card declaration can help control link previews on platforms that use Twitter card metadata.", [hurl])
+    else:
+        ok("seo", "Twitter card metadata is present")
+
+    # Heading hierarchy: report skipped levels without treating them as a guaranteed ranking issue.
+    heading_levels = [int(x[0][1]) for x in hd["h"] if x[0] in ("h1", "h2", "h3", "h4", "h5", "h6")]
+    skipped_levels = any(cur > prev + 1 for prev, cur in zip(heading_levels, heading_levels[1:]))
+    if skipped_levels:
+        add("seo", "low", "Heading hierarchy skips levels", "The extracted heading sequence skips one or more heading levels.", "A logical heading outline improves scanning and accessibility; heading level jumps can be intentional in some layouts.", [hurl])
+    elif heading_levels:
+        ok("seo", "No obvious skipped heading levels detected")
+
+    if not hd.get("has_main") and not hd.get("has_article"):
+        add("seo", "low", "No main or article landmark detected", "The returned HTML has no <main> or <article> element.", "Semantic landmarks help identify the primary content, although their absence does not prevent indexing.", [hurl])
+    else:
+        ok("seo", "A main-content landmark is present")
+
+    # Image and embedded-media checks.
+    images = hd.get("images", [])
+    missing_dims = [im for im in images if not im.get("width") or not im.get("height")]
+    if missing_dims:
+        add("seo", "low", "Image dimensions are not declared", f"{len(missing_dims)} of {len(images)} extracted images lack a width or height attribute.", "Declared dimensions help browsers reserve layout space and reduce unexpected layout shifts.", [hurl])
+    elif images:
+        ok("seo", "Extracted images declare width and height")
+    lazy_missing = [im for im in images[1:] if im.get("loading") != "lazy"]
+    if lazy_missing:
+        add("seo", "low", "Some non-leading images are not lazy-loaded", f"{len(lazy_missing)} images after the first extracted image do not declare loading=lazy.", "Lazy loading may reduce initial loading work for below-the-fold images. The crawler cannot reliably identify the actual LCP image, so the first image is excluded from this heuristic.", [hurl])
+    elif len(images) > 1:
+        ok("seo", "Images after the first declare lazy loading")
+    no_title_iframes = [f for f in hd.get("iframes", []) if not f.get("title")]
+    if no_title_iframes:
+        add("seo", "low", "Embedded frames lack titles", f"{len(no_title_iframes)} iframe elements have no title attribute.", "Iframe titles help assistive technology users understand embedded content.", [hurl])
+    elif hd.get("iframes"):
+        ok("seo", "Embedded frames have title attributes")
+
+    # Anchor quality and security attributes.
+    generic_anchors = {"click here", "read more", "learn more", "here", "more", "details"}
+    weak_anchors = [a for a in hd.get("atext", []) if norm(a) in generic_anchors or not norm(a)]
+    if weak_anchors:
+        add("seo", "low", "Generic or empty link text detected", f"{len(weak_anchors)} extracted links use generic or empty anchor text.", "Descriptive link text helps visitors and search engines understand the destination.", [hurl])
+    else:
+        ok("seo", "No obvious generic or empty link labels detected")
+    unsafe_targets = [a for a in hd.get("anchor_details", []) if a.get("target") == "_blank" and "noopener" not in a.get("rel", "") and "noreferrer" not in a.get("rel", "")]
+    if unsafe_targets:
+        add("seo", "low", "New-tab links lack rel protection", f"{len(unsafe_targets)} links with target=_blank do not declare rel=noopener or noreferrer.", "The rel attributes reduce access from the opened page to the originating window in supporting browsers.", [hurl])
+    elif any(a.get("target") == "_blank" for a in hd.get("anchor_details", [])):
+        ok("seo", "New-tab links include rel protection")
+
+    # Trust/contact signals and author metadata are heuristic; absence is not a ranking verdict.
+    if not hd["meta"].get("author", "").strip():
+        add("seo", "low", "Author metadata not detected", "No meta name=author value was found in the homepage HTML.", "Author metadata can be useful for editorial pages, but it is not required for every business homepage.", [hurl])
+    else:
+        ok("seo", "Author metadata is present")
+    trust_terms = ("about", "contact", "privacy", "terms", "impressum", "über uns", "ueber-uns", "kontakt", "datenschutz")
+    trust_links = [href for href in hd.get("links", []) if any(term in (urllib.parse.urlparse(urllib.parse.urljoin(hurl, href)).path.lower() + " " + href.lower()) for term in trust_terms)]
+    if trust_links:
+        ok("seo", "Homepage links to at least one trust or transparency page")
+    else:
+        add("seo", "low", "Trust or transparency links not detected", "No obvious About, Contact, Privacy, Terms or Impressum link was detected from the homepage.", "Clear business and privacy information can support visitor confidence. Custom link labels or routes may not be recognised.", [hurl])
+
+    # Off-page authority cannot be measured with HTML or the allowed PageSpeed API alone.
+    notes.append("Off-page authority (backlinks, referring domains, anchor-text profile, toxic links, independent reviews and unlinked brand mentions) was NOT VERIFIED because no backlink/brand data source is connected.")
+    notes.append("This SEO scan analyses the homepage only. Site-wide duplicate metadata, orphan pages, crawl depth, full sitemap quality, hreflang/pagination, rendered JavaScript content, and all internal/external link destinations are not fully verified.")
+    notes.append("Security-header presence is recorded as a limited homepage response check; certificate chain/expiry, responsive visual layout, tap-target sizing, full Core Web Vitals field data and mobile usability are not independently verified by HTML inspection.")
     S["seo"] = "done"
 
     # GEO — assess access, machine-readable identity, and useful extractable content.
@@ -546,6 +688,10 @@ def _run(A):
         weights = GEO_W if c == "geo" else W
         sc[c] = max(0, 100 - sum(weights[x["sev"]] for x in A["customer"] if x["cat"] == c))
     sc["speed"] = speed
+    # Cap SEO score when a critical indexability/access issue is detected.
+    critical_titles = {"Pages set to 'noindex'", "HTTP header sets noindex", "robots.txt blocks all crawlers", "Website is not served over HTTPS"}
+    if any(f.get("cat") == "seo" and f.get("title") in critical_titles and f.get("sev") == "high" for f in A["customer"]):
+        sc["seo"] = min(sc["seo"], 49)
     vals = [v for v in sc.values() if v is not None]
     order = sorted(A["customer"], key=lambda x: -W[x["sev"]])
     # Missing PSI is a coverage failure, not a passing score. Keep the numeric score provisional.
