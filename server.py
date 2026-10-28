@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Website audit backend (Python 3.9+, stdlib only).  Run: python3 server.py  ->  http://localhost:8000
 Env: LEAD_WEBHOOK_URL (optional; receives each lead as JSON), PSI_KEY (optional Google PageSpeed API key), INTERNAL_TOKEN (enables /api/internal/*), HOST, PORT,
-ALLOW_PRIVATE=1 (dev only: lets the crawler reach localhost/private IPs)."""
-import os, re, json, time, socket, hmac, ipaddress, secrets, threading
+RATE_LIMIT (audits per IP per hour, default 5), ALLOW_PRIVATE=1 (dev only: lets the crawler reach localhost/private IPs)."""
+import os, re, json, time, socket, hmac, ipaddress, secrets, threading, zlib
 import urllib.request, urllib.parse, urllib.error
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,8 +22,16 @@ CTA = (
 W = {"high": 15, "medium": 8, "low": 3, "info": 0}
 # GEO has a separate weighting model because some readiness signals are more consequential.
 GEO_W = {"high": 20, "medium": 10, "low": 4, "info": 0}
+# A category score can never look better than its worst open issue:
+# blocker -> max 49, high -> max 59 ("Needs work"), medium -> max 79 ("Needs attention").
+CAP = {"blocker": 49, "high": 59, "medium": 79}
+# Issues that stop the page from doing its job (being indexed, trusted or contacted), whatever else is in place.
+BLOCKERS = {"Pages without a title", "Pages set to 'noindex'", "HTTP header sets noindex", "robots.txt blocks all crawlers",
+            "Website is not served over HTTPS", "No clear contact route on the homepage"}
 STEPS = ("connect", "seo", "geo", "journey", "speed", "summary")
 ALLOW_PRIVATE = os.environ.get("ALLOW_PRIVATE") == "1"
+RATE_LIMIT = int(os.environ.get("RATE_LIMIT") or 5)
+KEEP_SECONDS = 7200  # audits are forgotten after 2 hours
 AUDITS, HITS = {}, {}
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -49,18 +57,56 @@ class Redir(urllib.request.HTTPRedirectHandler):
 OPENER = urllib.request.build_opener(Redir)
 
 
+class AuditError(Exception):
+    """Audit stops with a message the visitor can understand."""
+
+
+def decode_body(raw, encoding):
+    # Some servers compress the response even when it was not requested: decompress before reading it as text.
+    enc = (encoding or "").lower().strip()
+    if enc in ("gzip", "x-gzip", "deflate"):
+        for wbits in ((16 + zlib.MAX_WBITS, zlib.MAX_WBITS, -zlib.MAX_WBITS) if "gzip" in enc else (zlib.MAX_WBITS, -zlib.MAX_WBITS)):
+            try:
+                raw = zlib.decompressobj(wbits).decompress(raw, MAX_BYTES)
+                break
+            except zlib.error:
+                continue
+        else:
+            raise AuditError("The website sent a compressed response that could not be read.")
+    elif enc and enc != "identity":
+        # br / zstd are not in the standard library; only gzip/deflate are requested, so this is rare.
+        raise AuditError("The website sent its page in a format this tool cannot read (" + enc + ").")
+    return raw.decode("utf-8", "replace")
+
+
 def fetch(url, method="GET"):
     check(url)
     t = time.time()
-    req = urllib.request.Request(url, method=method, headers={"User-Agent": UA})
+    req = urllib.request.Request(url, method=method, headers={"User-Agent": UA, "Accept-Encoding": "gzip, deflate"})
     try:
         r = OPENER.open(req, timeout=TIMEOUT)
     except urllib.error.HTTPError as e:
         r = e
-    body = b"" if method == "HEAD" else r.read(MAX_BYTES)
+    body = "" if method == "HEAD" else decode_body(r.read(MAX_BYTES), r.headers.get("content-encoding"))
     return dict(status=r.code, url=r.geturl(), ctype=r.headers.get("content-type", ""),
                 headers={str(k).lower(): str(v) for k, v in r.headers.items()},
-                body=body.decode("utf-8", "replace"), ms=int((time.time() - t) * 1000))
+                body=body, ms=int((time.time() - t) * 1000))
+
+
+# Bot protection / challenge pages: auditing them would report on a "page" that visitors never see.
+CHALLENGE = re.compile(r"cf-browser-verification|cf_chl_opt|<title>\s*(just a moment|attention required|access denied|"
+                       r"ddos-guard|security check|please wait)|_incapsula_resource|px-captcha|captcha-delivery|"
+                       r"sgcaptcha|checking your browser", re.I)
+
+
+def is_challenge(r):
+    h = r.get("headers", {})
+    protected = "cf-ray" in h or bool(re.search(r"cloudflare|ddos-guard|sucuri|akamai", h.get("server", ""), re.I))
+    if r["status"] in (403, 429, 503) and protected:
+        return True
+    # Markers only count on a nearly empty page: normal pages behind a firewall can carry similar scripts.
+    text = re.sub(r"(?is)<(script|style)\b.*?</\1>|<[^>]+>", " ", r["body"][:200000])
+    return len(text.split()) < 150 and bool(CHALLENGE.search(r["body"][:20000]))
 
 
 def tf(url, method="GET"):
@@ -231,6 +277,9 @@ ASSET = re.compile(r"\.(jpe?g|png|gif|webp|svg|pdf|zip|css|js|ico|mp4|xml)$", re
 def run(A):
     try:
         _run(A)
+    except AuditError as e:
+        A["internal"].append(dict(cat="system", sev="info", title="Audit stopped", what=str(e), why="", urls=[], evidence=""))
+        A.update(status="failed", message=str(e))
     except Exception as e:
         A["internal"].append(dict(cat="system", sev="info", title="Audit failed", what=repr(e), why="", urls=[], evidence=""))
         A.update(status="failed", message="We couldn't reach or read this website. Please check the address and try again.")
@@ -240,7 +289,14 @@ def _run(A):
     t0, S, notes = time.time(), A["steps"], []
     url = A["url"]; u = urllib.parse.urlparse(url); origin = f"{u.scheme}://{u.netloc}"
     A.update(status="discovering", message="Connecting to your website…"); S["connect"] = "running"
-    home = fetch(url)
+    try:
+        home = fetch(url)
+    except (urllib.error.URLError, socket.timeout, ConnectionError, TimeoutError):
+        time.sleep(2)
+        home = fetch(url)  # one retry for a slow or briefly unavailable connection
+    if is_challenge(home):
+        raise AuditError("This website blocks automated checks (bot protection or a captcha), so the page could not be read. "
+                         "Allow the audit tool in the firewall / bot protection settings and try again.")
     if home["status"] >= 400 or "html" not in home["ctype"].lower():
         raise RuntimeError(f"homepage status {home['status']}")
     S["connect"] = "done"; hurl = home["url"]
@@ -262,6 +318,9 @@ def _run(A):
 
     pages = {hurl: {**parse(home), "status": 200}}
     hd = pages[hurl]
+    # Little text plus an empty app root or many scripts: content is probably rendered in the browser.
+    js_shell = hd["words"] < 80 and bool(re.search(r"<div[^>]+id=[\"'](root|app|__next|__nuxt)[\"'][^>]*>\s*</div>", home["body"], re.I)
+                                         or home["body"].lower().count("<script") >= 8)
     cand = []
     for h in hd["links"] + locs:
         x = urllib.parse.urldefrag(urllib.parse.urljoin(hurl, h))[0]
@@ -683,17 +742,35 @@ def _run(A):
 
     # Summary
     S["summary"] = "running"
-    sc = {}
-    for c in ("seo", "geo", "journey"):
+    if js_shell:
+        notes.append("This page appears to build its content with JavaScript in the browser. This tool reads the HTML sent by the server, "
+                     "so content, headings and links added later may be missing and content-related findings may be overstated.")
+    for f in A["customer"]:
+        f["blocker"] = f["title"] in BLOCKERS and f["sev"] == "high"
+    sc, caps = {}, {}
+    for c in ("seo", "geo", "journey", "speed"):
+        issues = [x for x in A["customer"] if x["cat"] == c]
         weights = GEO_W if c == "geo" else W
-        sc[c] = max(0, 100 - sum(weights[x["sev"]] for x in A["customer"] if x["cat"] == c))
-    sc["speed"] = speed
-    # Cap SEO score when a critical indexability/access issue is detected.
-    critical_titles = {"Pages set to 'noindex'", "HTTP header sets noindex", "robots.txt blocks all crawlers", "Website is not served over HTTPS"}
-    if any(f.get("cat") == "seo" and f.get("title") in critical_titles and f.get("sev") == "high" for f in A["customer"]):
-        sc["seo"] = min(sc["seo"], 49)
-    vals = [v for v in sc.values() if v is not None]
-    order = sorted(A["customer"], key=lambda x: -W[x["sev"]])
+        base = speed if c == "speed" else max(0, 100 - sum(weights[x["sev"]] for x in issues))
+        if base is None:
+            sc[c] = None
+            continue
+        # The worst open issue sets a ceiling, so many passed checks cannot hide one serious gap.
+        worst = "blocker" if any(x["blocker"] for x in issues) else "high" if any(x["sev"] == "high" for x in issues) \
+            else "medium" if any(x["sev"] == "medium" for x in issues) else None
+        sc[c] = min(base, CAP[worst]) if worst else base
+        if sc[c] < base: caps[c] = worst
+    vals = {k: v for k, v in sc.items() if v is not None}
+    # Overall: the average, but at most 20 points above the weakest area, and max 59 ("Needs work")
+    # when two or more areas need work. Strong areas cannot average away weak ones.
+    overall, limited_by = None, None
+    if vals:
+        avg = round(sum(vals.values()) / len(vals))
+        weakest = min(vals, key=vals.get)
+        overall = min(avg, vals[weakest] + 20)
+        if sum(1 for v in vals.values() if v < 60) >= 2: overall = min(overall, 59)
+        if overall < avg: limited_by = weakest
+    order = sorted(A["customer"], key=lambda x: (not x["blocker"], -W[x["sev"]]))
     # Missing PSI is a coverage failure, not a passing score. Keep the numeric score provisional.
     speed_missing = speed is None
     assessment = "incomplete" if speed_missing else "complete"
@@ -707,7 +784,12 @@ def _run(A):
         notes.append(f"PageSpeed/Lighthouse SEO category score: {psi_seo}/100. This is a supplementary signal, not a replacement for the internal SEO audit.")
     A["report"] = dict(
         generated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), domain=urllib.parse.urlparse(hurl).hostname,
-        final_url=hurl, scores=sc, overall=round(sum(vals) / len(vals)) if vals else None, findings=order, passed=A["passed"],
+        final_url=hurl, scores=sc, overall=overall, limited_by=limited_by, caps=caps, js_rendered=bool(js_shell),
+        findings=order, passed=A["passed"],
+        # Presentation only (does not change any score): open issues and passed checks per category.
+        checks={c: dict(passed=sum(1 for x in A["passed"] if x["cat"] == c),
+                        **{k: sum(1 for x in A["customer"] if x["cat"] == c and x["sev"] == k) for k in ("high", "medium", "low")})
+                for c in ("seo", "geo", "journey", "speed")},
         assessment_status=assessment, limitations=limitations,
         coverage=dict(pages_analysed=n, pages_discovered=1, page_limit=1, notes=notes,
                       speed=(f"Performance {speed}/100; LCP {psi['lcp']}, TBT {psi['tbt']}, CLS {psi['cls']}" if "score" in psi else None),
@@ -761,7 +843,7 @@ class H(BaseHTTPRequestHandler):
         if s.path != "/api/audits": return s.send(404, {"error": "not found"})
         ip, now = (s.headers.get("X-Nf-Client-Connection-Ip") or s.headers.get("X-Forwarded-For", "").split(",")[0].strip() or s.client_address[0]), time.time()
         HITS[ip] = [x for x in HITS.get(ip, []) if now - x < 3600]
-        if len(HITS[ip]) >= 5: return s.send(429, {"error": "Too many requests. Please try again later."})
+        if len(HITS[ip]) >= RATE_LIMIT: return s.send(429, {"error": "Too many requests. Please try again later."})
         try: d = json.loads(s.rfile.read(min(int(s.headers.get("Content-Length", 0)), 10000)))
         except Exception: return s.send(400, {"error": "Invalid request."})
         if d.get("hp"): return s.send(200, {"token": secrets.token_urlsafe(16)})  # honeypot
@@ -772,9 +854,10 @@ class H(BaseHTTPRequestHandler):
         try: check(url)
         except Exception: return s.send(400, {"error": "Please enter a valid, public website address."})
         HITS[ip].append(now)
+        for k in [k for k, v in list(AUDITS.items()) if now - v.get("at", now) > KEEP_SECONDS]: AUDITS.pop(k, None)
         token = secrets.token_urlsafe(16)
         A = AUDITS[token] = dict(url=url, status="queued", message="Waiting to start…", steps={k: "waiting" for k in STEPS},
-                                 pages_discovered=0, pages_analysed=0, customer=[], internal=[], passed=[], report=None)
+                                 pages_discovered=0, pages_analysed=0, customer=[], internal=[], passed=[], report=None, at=now)
         lead = dict(name=name, email=email, url=url, consent=True, at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         threading.Thread(target=deliver_lead, args=(lead,), daemon=True).start()
         threading.Thread(target=run, args=(A,), daemon=True).start()

@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: avantico-audit
+    name: page-audit
     runtime: python
     plan: free
     buildCommand: echo "no dependencies"

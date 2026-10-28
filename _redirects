@@ -1,2 +1,2 @@
-# Ganti NAMA-SERVICE dengan nama service Anda di Render
-/api/*  https://avantico-seogeotool-75b22.containers.snapdeploy.app/api/:splat  200!
+# Replace YOUR-BACKEND-HOST with the public URL of the server running server.py
+/api/*  https://YOUR-BACKEND-HOST/api/:splat  200!

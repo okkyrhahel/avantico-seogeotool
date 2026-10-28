@@ -1,6 +1,6 @@
-# AVANTICO Website Visibility Audit Tool
+# Website Page Audit Tool
 
-A lead-generation tool that audits a public website and returns a clear, customer-friendly report covering **SEO**, **GEO (AI-search readiness)**, **PageSpeed** and the **enquiry journey**. A visitor enters their name, email and website; the tool crawls the site, scores it and shows the results in the browser.
+A general tool that audits a public web page and returns a clear report covering **SEO**, **GEO (AI-search readiness)**, **PageSpeed** and the **enquiry journey**. The visitor enters their name, email and a page URL; the tool checks the page, scores it and shows a prioritised list of what is still missing.
 
 - **Backend:** one Python file (`server.py`), standard library only. No `pip install`.
 - **Frontend:** one HTML file (`index.html`), Bootstrap 5.0.2 and Plus Jakarta Sans via CDN.
@@ -14,13 +14,14 @@ A lead-generation tool that audits a public website and returns a clear, custome
 | `index.html` | The whole UI: form, progress screen, report |
 | `Dockerfile` | Container image (Python 3.12 slim, port 8000) |
 | `README.md` | This document |
+| `render.yaml` / `_redirects` | Optional Render blueprint / Netlify proxy for `/api/*` (set your own backend URL) |
 
 ## How it works
 
 1. The visitor submits name, email, website URL and a consent checkbox.
 2. The backend creates an audit (random token), stores the lead, and starts the audit in a background thread.
 3. The page polls `/api/audits/<token>/status` every 1.5 s and shows live progress for six steps: connect, SEO, GEO, enquiry journey, speed, summary.
-4. When finished, the page loads the report and shows: overall score, four category scores, "things to know first" (top 5 findings), full findings per category, passed checks, and coverage notes.
+4. When finished, the page loads the report. It leads with **what is missing**: a headline with the number of high-impact gaps, a tally (fix first / fix next / nice to have / passed), and a warning when the overall score looks better than the weakest area. Then four area cards (score, open issues, checks passed; click to filter), the to-do list grouped by priority (tick off, open for "why it matters"), passed checks, and coverage notes. The list can be copied as text or printed / saved as PDF.
 
 ### What is checked
 
@@ -33,16 +34,25 @@ A lead-generation tool that audits a public website and returns a clear, custome
 
 ### Scoring
 
-- SEO, GEO and Enquiry journey each start at 100 and lose points per finding: **High -15, Medium -8, Low -3**.
+- SEO, GEO and Enquiry journey each start at 100 and lose points per finding: **High -15, Medium -8, Low -3** (GEO: -20 / -10 / -4).
 - PageSpeed uses the Lighthouse mobile performance score directly (shown as unavailable if the API did not answer).
-- The overall score is the average of the available category scores.
+- **Ceiling per area:** an area can never score higher than its worst open issue allows: a **blocker** caps it at 49, a **high** issue at 59, a **medium** issue at 79. Many passed checks therefore cannot hide one serious gap.
+- **Blockers** are issues that stop the page from doing its job: no title, noindex (meta or header), robots.txt blocking all crawlers, no HTTPS, no contact route.
+- **Overall score:** the average of the available areas, but at most 20 points above the weakest area, and at most 59 when two or more areas are below 60. The report names the area that holds the score back (`limited_by`).
 - Score bands: 80+ "Looking good", 60-79 "Needs attention", below 60 "Needs work".
+
+### Reading the page
+
+- Compressed responses (gzip / deflate) are decompressed before the HTML is read.
+- If the page is a bot-protection / captcha page (Cloudflare challenge and similar), the audit stops with a clear message instead of reporting on the challenge page.
+- If the page seems to be built with JavaScript in the browser (very little text and an empty app root or many scripts), the report adds a coverage note that content-related findings may be overstated.
+- The first request is retried once after a connection error or timeout.
 
 The report footer shows an **Audit ID**, how long the audit took and when the PageSpeed test actually ran. A different Audit ID proves a new audit; a repeated PageSpeed time means Google reused its own earlier test.
 
 ### Crawl limits
 
-Up to **12 pages** per audit (homepage plus pages found in its links and the sitemap), **8 s** timeout per request, **1.5 MB** per page, **60 s** crawl budget. If a limit is reached, the report says so under "Coverage & method".
+**1 page** per audit (the final URL after redirects; robots.txt, sitemap and llms.txt are read from its origin), **8 s** timeout per request, **1.5 MB** per page. Up to 15 internal links on the page are checked for errors.
 
 ## Run locally
 
@@ -66,7 +76,7 @@ docker run -p 8000:8000 -e PSI_KEY=your_key site-audit
 
 ## Deploy
 
-Push the four files to a git repository and connect it to any host that builds a Dockerfile (for example SnapDeploy). Set the environment variables below. The health check path is `/health`. Because the server serves `index.html` itself, the host's public URL is the tool's URL.
+Push the files to a git repository and connect it to any host that builds a Dockerfile (for example SnapDeploy). Set the environment variables below. The health check path is `/health`. Because the server serves `index.html` itself, the host's public URL is the tool's URL.
 
 > Every audit gets its own random token and its own isolated state; the page is fully reset before each new audit. Reports and audits are held **in memory** and are forgotten after 2 hours, or when the container restarts or redeploys. That is fine for a live demo; for persistent reports, add storage first.
 
@@ -75,7 +85,7 @@ Push the four files to a git repository and connect it to any host that builds a
 | Variable | Required | Description |
 |---|---|---|
 | `PSI_KEY` | Recommended | Google PageSpeed Insights API key (free; create it in a Google Cloud project). Without a key the API is heavily rate limited and PageSpeed may show as unavailable. |
-| `LEAD_WEBHOOK_URL` | Optional | Every lead (name, email, URL, consent, timestamp) is POSTed here as JSON, for example a Zapier, Make or Google Apps Script webhook. Leads are always printed to the server log as `LEAD {...}` as a fallback. |
+| `LEAD_WEBHOOK_URL` | Optional | Every submission (name, email, URL, consent, timestamp) is POSTed here as JSON, for example a Zapier, Make or Google Apps Script webhook. Submissions are always printed to the server log as `LEAD {...}` as a fallback. |
 | `INTERNAL_TOKEN` | Optional | Enables the private endpoint `/api/internal/audits/<token>` that returns the detailed internal findings. Send it as `Authorization: Bearer <token>`. Disabled when unset. |
 | `HOST` | Optional | Bind address. Use `0.0.0.0` in containers (the Dockerfile sets it). Default `127.0.0.1`. |
 | `PORT` | Optional | Port. Default `8000`. |
@@ -98,12 +108,11 @@ Push the four files to a git repository and connect it to any host that builds a
 - **SSRF protection:** hostnames are resolved and private, loopback, link-local and reserved IPs are blocked, including on redirects.
 - **Rate limit:** 5 audits per IP per hour.
 - **Honeypot field** and consent checkbox on the form; email format and input size validated server-side.
-- **Customer vs internal:** the customer report lists findings and their impact only. Affected URLs and technical evidence stay on the internal endpoint.
+- **Public vs internal:** the public report lists findings and their impact only. Affected URLs and technical evidence stay on the internal endpoint.
 - Findings come from automated checks of public pages and are not a guarantee of ranking.
 
 ## Customising
 
-- Brand name and the "A" mark are in the navbar and footer of `index.html`.
-- The "Discuss your results" button opens an email to `hello@avantico.com` (`index.html`).
-- The accent colour is the CSS variable `--blue` at the top of the stylesheet; the design is a tech-phase design and can change once the AVANTICO brand identity is ready.
-- The crawler identifies itself as `AVANTICO-AuditBot/1.0` (`server.py`).
+- The tool name and mark are in the navbar and footer of `index.html`.
+- The accent colour is the CSS variable `--blue` at the top of the stylesheet.
+- The crawler identifies itself as `SiteAuditBot/1.0` (`server.py`).
