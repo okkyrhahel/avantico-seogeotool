@@ -1,14 +1,41 @@
 #!/usr/bin/env python3
-"""Website audit backend (Python 3.9+, stdlib only).  Run: python3 server.py  ->  http://localhost:8000
-Env: LEAD_WEBHOOK_URL (optional; receives each lead as JSON), PSI_KEY (optional Google PageSpeed API key), INTERNAL_TOKEN (enables /api/internal/*), HOST, PORT,
+"""Website audit backend - browser version (Python 3.9+ standard library only, no pip; Google Chrome or Edge installed).
+Run: python server.py  ->  http://localhost:8000
+A real browser (the installed Chrome, driven by cdp.py over the Chrome DevTools Protocol) opens the homepage and up to
+MAX_PAGES-1 subpages like a visitor would: JavaScript runs, the rendered page is scored, the homepage is also checked on a
+phone-sized screen. Settings can also come from a .env file in this folder or the Tool folder.
+Env: BROWSER_CHANNEL (chrome | msedge, default chrome), BROWSER_PATH (full path to the browser), MAX_BROWSERS (parallel
+audits with a browser, default 2),
+LEAD_WEBHOOK_URL (optional; receives each lead as JSON), PSI_KEY (optional Google PageSpeed API key), INTERNAL_TOKEN (enables /api/internal/*), HOST, PORT,
 RATE_LIMIT (audits per IP per hour, default 5), ALLOW_PRIVATE=1 (dev only: lets the crawler reach localhost/private IPs)."""
 import os, re, json, time, socket, hmac, ipaddress, secrets, threading, zlib
 import urllib.request, urllib.parse, urllib.error
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from inputs import COUNTRIES, normalize_url, normalize_phone, country_checks
+from cdp import Chrome
 
-MAX_PAGES, TIMEOUT, MAX_BYTES, BUDGET = 1, 8, 1_500_000, 60  # One detailed homepage audit; avoids averaging away weak pages
+
+def load_env_file():
+    """Local settings (PSI_KEY, INTERNAL_TOKEN, ...) from a .env file in this folder or the Tool folder above it.
+    Real environment variables win; the .env file is for local runs only and must not be published."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for f in (os.path.join(here, ".env"), os.path.join(here, "..", ".env")):
+        try:
+            for line in open(f, encoding="utf-8"):
+                k, sep, v = line.strip().partition("=")
+                if sep and k and not k.startswith("#"):
+                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+        except OSError:
+            pass
+
+
+load_env_file()
+
+MAX_PAGES, TIMEOUT, MAX_BYTES, BUDGET = 10, 8, 1_500_000, 120  # homepage + up to 9 subpages, each scored on its own (no averaging)
 UA = "SiteAuditBot/1.0"
+BROWSERS = threading.Semaphore(int(os.environ.get("MAX_BROWSERS") or 2))
+NAV_TIMEOUT = 25  # seconds per page in the browser
 AI_BOTS = ["GPTBot", "ClaudeBot", "PerplexityBot", "Google-Extended", "CCBot"]
 CTA = (
     # English
@@ -28,7 +55,8 @@ CAP = {"blocker": 49, "high": 59, "medium": 79}
 # Issues that stop the page from doing its job (being indexed, trusted or contacted), whatever else is in place.
 BLOCKERS = {"Pages without a title", "Pages set to 'noindex'", "HTTP header sets noindex", "robots.txt blocks all crawlers",
             "Website is not served over HTTPS", "No clear contact route on the homepage"}
-STEPS = ("connect", "seo", "geo", "journey", "speed", "summary")
+STEPS = ("connect", "render", "seo", "geo", "content", "journey", "speed", "summary")
+CATS = ("seo", "geo", "content", "journey", "speed")
 ALLOW_PRIVATE = os.environ.get("ALLOW_PRIVATE") == "1"
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT") or 5)
 KEEP_SECONDS = 7200  # audits are forgotten after 2 hours
@@ -270,8 +298,84 @@ def get_psi(url):
         return {"error": type(e).__name__}
 
 
+# ---------- real browser (installed Chrome via cdp.py) ----------
+# Collected inside the rendered page. Visible text only (innerText), so hidden menus/templates do not count as content.
+PAGE_JS = r"""(mobile) => {
+  const vis = el => { const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none' && +cs.opacity !== 0; };
+  const text = (document.body && document.body.innerText) || '';
+  const clickables = [...document.querySelectorAll('a[href], button, [role=button], input[type=submit]')].filter(vis);
+  const vh = innerHeight, vw = innerWidth;
+  const label = el => (el.innerText || el.value || el.getAttribute('aria-label') || el.title || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+  const firstScreen = clickables.filter(el => { const r = el.getBoundingClientRect(); return r.top < vh && r.bottom > 0; })
+                                .map(el => ({label: label(el).toLowerCase(), href: el.href || ''}));
+  const small = mobile ? clickables.filter(el => { const r = el.getBoundingClientRect(); return (r.width < 32 || r.height < 32) && label(el); }).length : 0;
+  let tiny = 0, sized = 0;
+  if (mobile) for (const el of document.querySelectorAll('p, li, span, a, td')) {
+    if (!el.childNodes.length || ![...el.childNodes].some(n => n.nodeType === 3 && n.textContent.trim().length > 3) || !vis(el)) continue;
+    sized++; if (parseFloat(getComputedStyle(el).fontSize) < 12) tiny++; }
+  const imgs = [...document.images].filter(i => i.complete && i.currentSrc && !i.currentSrc.startsWith('data:'));
+  return {
+    text, words: text.split(/\s+/).filter(Boolean).length,
+    links: [...new Set([...document.querySelectorAll('a[href]')].map(a => a.href))],
+    nav: [...new Set([...document.querySelectorAll('header a[href], nav a[href], [role=navigation] a[href]')].map(a => a.href))],
+    first_screen: firstScreen, small_targets: small, tiny_text: tiny, text_elements: sized,
+    overflow: document.documentElement.scrollWidth > vw + 4,
+    broken_images: imgs.filter(i => i.naturalWidth === 0).map(i => i.currentSrc).slice(0, 10),
+    hreflang: [...document.querySelectorAll('link[rel=alternate][hreflang]')].map(l => l.hreflang),
+    copyright: (text.match(/(?:©|copyright)\s*(?:\d{4}\s*[-–]\s*)?(\d{4})/i) || [])[1] || null,
+  };
+}"""
+
+_HOSTS = {}
+
+
+def host_allowed(url):
+    """SSRF guard for every request the browser makes (pages, redirects, images, scripts)."""
+    h = urllib.parse.urlparse(url).hostname
+    if not h:
+        return True  # data:, blob:
+    if h not in _HOSTS:
+        try:
+            check(url); _HOSTS[h] = True
+        except Exception:
+            _HOSTS[h] = False
+    return _HOSTS[h]
+
+
+class Browser:
+    """One Chrome instance per audit; each visit opens an isolated tab (desktop 1366x900, or a phone 390x844 with touch)."""
+
+    def __enter__(s):
+        BROWSERS.acquire()
+        try:
+            s.chrome = Chrome().__enter__()
+        except Exception:
+            BROWSERS.release(); raise
+        return s
+
+    def __exit__(s, *a):
+        try:
+            s.chrome.__exit__(*a)
+        finally:
+            BROWSERS.release()
+
+    def visit(s, url, mobile=False):
+        page = s.chrome.new_page(mobile=mobile, guard=host_allowed)
+        try:
+            r = page.goto(url, timeout=NAV_TIMEOUT)
+            page.wait_idle()  # many sites never go fully idle (chat, analytics): wait at most a few seconds
+            if not mobile:  # scroll once so lazy-loaded sections render, as a visitor would see them
+                page.run("window.scrollTo(0, document.body.scrollHeight)"); time.sleep(0.7); page.run("window.scrollTo(0, 0)")
+            data = page.evaluate(PAGE_JS, mobile)
+            return dict(status=r["status"], url=r["url"], ctype=r["headers"].get("content-type", "text/html"), headers=r["headers"],
+                        body=page.content(), ms=r["ms"], rendered=data, console=page.console[:10], failed=page.failed[:10])
+        finally:
+            page.close()
+
+
 # ---------- the audit ----------
-ASSET = re.compile(r"\.(jpe?g|png|gif|webp|svg|pdf|zip|css|js|ico|mp4|xml)$", re.I)
+ASSET =re.compile(r"\.(jpe?g|png|gif|webp|svg|pdf|zip|css|js|ico|mp4|xml)$", re.I)
 
 
 def run(A):
@@ -289,11 +393,20 @@ def _run(A):
     t0, S, notes = time.time(), A["steps"], []
     url = A["url"]; u = urllib.parse.urlparse(url); origin = f"{u.scheme}://{u.netloc}"
     A.update(status="discovering", message="Connecting to your website…"); S["connect"] = "running"
+
+    def first_fetch(x):
+        try:
+            return fetch(x)
+        except (urllib.error.URLError, socket.timeout, ConnectionError, TimeoutError):
+            time.sleep(2)
+            return fetch(x)  # one retry for a slow or briefly unavailable connection
     try:
-        home = fetch(url)
-    except (urllib.error.URLError, socket.timeout, ConnectionError, TimeoutError):
-        time.sleep(2)
-        home = fetch(url)  # one retry for a slow or briefly unavailable connection
+        home = first_fetch(url)
+    except (urllib.error.URLError, socket.timeout, ConnectionError, TimeoutError, OSError):
+        if A.get("scheme_given") or not url.startswith("https://"):
+            raise
+        url = "http://" + url[len("https://"):]  # address typed without http(s)://: try plain http before giving up
+        home = first_fetch(url)
     if is_challenge(home):
         raise AuditError("This website blocks automated checks (bot protection or a captcha), so the page could not be read. "
                          "Allow the audit tool in the firewall / bot protection settings and try again.")
@@ -316,34 +429,61 @@ def _run(A):
             r2 = tf(locs[0]); locs = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", r2["body"]) if r2 and r2["status"] == 200 else []
     has_sitemap = bool(locs)
 
-    pages = {hurl: {**parse(home), "status": 200}}
+    # What a crawler that does not run JavaScript receives (many AI crawlers): kept for the GEO comparison.
+    raw = parse(home)
+    js_shell = raw["words"] < 80 and bool(re.search(r"<div[^>]+id=[\"'](root|app|__next|__nuxt)[\"'][^>]*>\s*</div>", home["body"], re.I)
+                                          or home["body"].lower().count("<script") >= 8)
+
+    # Visit the site in a real browser, like a visitor: homepage (desktop + phone), then the pages its menu leads to.
+    A.update(status="discovering", message="Opening the website in a browser…"); S["render"] = "running"
+    pages, rend, broken_pages = {}, {}, []
+    try:
+        with Browser() as B:
+            hp = B.visit(hurl)
+            if is_challenge(hp):
+                raise AuditError("This website blocks automated browsers (bot protection or a captcha), so the page could not be read. "
+                                 "Allow the audit tool in the firewall / bot protection settings and try again.")
+            hurl = hp["url"] if host(hp["url"]) == host(hurl) else hurl
+            pages[hurl] = {**parse(hp), "status": hp["status"]}; rend[hurl] = hp
+            mob = B.visit(hurl, mobile=True)
+            # Menu links first (what a visitor clicks), important pages first, then other homepage links, then the sitemap.
+            r0 = hp["rendered"]
+            prio = ("kontakt", "contact", "about", "ueber", "uber", "team", "studio", "service", "leistung", "angebot",
+                    "preis", "price", "pricing", "tarif", "kurs", "class", "product", "produkt", "faq", "impressum")
+            cand = []
+            for h in r0["nav"] + r0["links"] + locs:
+                x = urllib.parse.urldefrag(urllib.parse.urljoin(hurl, h))[0]
+                p = urllib.parse.urlparse(x)
+                if p.scheme in ("http", "https") and host(x) == host(hurl) and not ASSET.search(p.path) \
+                        and x.rstrip("/") != hurl.rstrip("/") and x not in cand:
+                    cand.append(x)
+            nav_set = {urllib.parse.urldefrag(x)[0] for x in r0["nav"]}
+            cand.sort(key=lambda x: (x not in nav_set, not any(k in x.lower() for k in prio)))
+            A.update(status="analysing", pages_discovered=1 + len(cand), pages_analysed=1, message="Visiting the pages a visitor would open…")
+            for x in cand[:MAX_PAGES - 1]:
+                if time.time() - t0 > BUDGET:
+                    notes.append("The time budget was reached, so some discovered pages were not analysed."); break
+                try:
+                    r = B.visit(x)
+                except Exception:
+                    broken_pages.append(x); continue
+                if r["status"] >= 400:
+                    broken_pages.append(x)
+                elif "html" in r["ctype"].lower() and r["url"] not in pages and host(r["url"]) == host(hurl):
+                    pages[r["url"]] = {**parse(r), "status": r["status"]}; rend[r["url"]] = r
+                A["pages_analysed"] = len(pages)
+    except AuditError:
+        raise
+    except Exception as e:
+        if not pages:
+            raise AuditError("The website could not be opened in the audit browser (" + type(e).__name__ + "). Please try again.")
+        notes.append("The browser stopped early (" + type(e).__name__ + "); the pages opened so far are included.")
+    S["render"] = "done"
     hd = pages[hurl]
-    # Little text plus an empty app root or many scripts: content is probably rendered in the browser.
-    js_shell = hd["words"] < 80 and bool(re.search(r"<div[^>]+id=[\"'](root|app|__next|__nuxt)[\"'][^>]*>\s*</div>", home["body"], re.I)
-                                         or home["body"].lower().count("<script") >= 8)
-    cand = []
-    for h in hd["links"] + locs:
-        x = urllib.parse.urldefrag(urllib.parse.urljoin(hurl, h))[0]
-        p = urllib.parse.urlparse(x)
-        if p.scheme in ("http", "https") and host(x) == host(hurl) and not ASSET.search(p.path) \
-                and x.rstrip("/") != hurl.rstrip("/") and x not in cand:
-            cand.append(x)
-    # This version deliberately scores one page (the final homepage URL) in depth.
-    # We still inspect sitemap availability, but do not mix other pages into this page score.
-    cand = []
-    A.update(status="analysing", pages_discovered=1, pages_analysed=1, message="Auditing the homepage in detail…")
-    S["seo"] = "running"; skipped = 0
-    for x in cand:
-        if time.time() - t0 > BUDGET:
-            notes.append("The time budget was reached, so some discovered pages were not analysed."); break
-        r = tf(x)
-        if r and r["status"] < 400 and "html" in r["ctype"].lower():
-            pages[r["url"]] = {**parse(r), "status": r["status"]}
-        else:
-            skipped += 1
-        A["pages_analysed"] = len(pages)
     n = len(pages)
-    notes.append("This report scores the final homepage URL only. Other pages are not included in the score.")
+    notes.append(f"Opened {n} page(s) in a real browser (Chrome) with JavaScript, like a visitor: the homepage and the pages its menu "
+                 f"links to (limit {MAX_PAGES}). Each finding says how many of these pages are affected.")
+    S["seo"] = "running"
 
     def add(cat, sev, title, what, why, urls=(), ev=""):
         A["internal"].append(dict(cat=cat, sev=sev, title=title, what=what, why=why, urls=list(urls), evidence=ev))
@@ -517,8 +657,35 @@ def _run(A):
 
     # Off-page authority cannot be measured with HTML or the allowed PageSpeed API alone.
     notes.append("Off-page authority (backlinks, referring domains, anchor-text profile, toxic links, independent reviews and unlinked brand mentions) was NOT VERIFIED because no backlink/brand data source is connected.")
-    notes.append("This SEO scan analyses the homepage only. Site-wide duplicate metadata, orphan pages, crawl depth, full sitemap quality, hreflang/pagination, rendered JavaScript content, and all internal/external link destinations are not fully verified.")
-    notes.append("Security-header presence is recorded as a limited homepage response check; certificate chain/expiry, responsive visual layout, tap-target sizing, full Core Web Vitals field data and mobile usability are not independently verified by HTML inspection.")
+    notes.append("Site-wide checks cover the opened pages only. Orphan pages, full sitemap quality, hreflang/pagination and external link destinations are not fully verified.")
+
+    # Found by the browser: pages from the menu that fail, script errors, files that do not load, broken images.
+    if broken_pages:
+        add("seo", "high", "Pages linked from the website do not open", f"{len(broken_pages)} linked page(s) returned an error or did not load in the browser.",
+            "Visitors who click these links reach an error instead of content, and search engines may drop the pages.", broken_pages)
+    else:
+        ok("seo", "All opened pages loaded without an error")
+    slug_re = re.compile(r"/(?:blank|copy-of|untitled|new-page|page|seite|kopie-von|neue-seite)(?:[-_]\d+)*(?:/|$)|/[^/]*-\d+-\d+(?:/|$)", re.I)
+    vague = [x for x in pages if slug_re.search(urllib.parse.urlparse(x).path + "/")]
+    if vague:
+        add("seo", "medium", "Page addresses do not describe the content", f"{len(vague)} of {n} analysed pages use a generic address such as /blank-6 or /copy-of-...",
+            "Descriptive addresses help visitors and search engines understand a page before opening it. Generic names often come from "
+            "website-builder defaults that were never renamed.", vague, ", ".join(vague[:5]))
+    else:
+        ok("seo", "Page addresses use descriptive words")
+    js_err = [x for x, r in rend.items() if r["console"]]
+    if js_err:
+        add("seo", "low", "JavaScript errors in the browser", f"{len(js_err)} of {n} analysed pages report script errors in the browser console.",
+            "Script errors can break menus, forms or tracking for some visitors.", js_err, json.dumps({x: rend[x]["console"][:3] for x in js_err[:3]}))
+    else:
+        ok("seo", "No JavaScript errors were reported in the browser")
+    bad_files = [x for x, r in rend.items() if r["failed"] or r["rendered"]["broken_images"]]
+    if bad_files:
+        add("seo", "medium", "Images or files fail to load", f"{len(bad_files)} of {n} analysed pages request images, scripts or styles that return an error.",
+            "Missing images and files make pages look broken and can hide content.", bad_files,
+            json.dumps({x: (rend[x]["failed"] + rend[x]["rendered"]["broken_images"])[:4] for x in bad_files[:3]}))
+    else:
+        ok("seo", "Images and files load without errors")
     S["seo"] = "done"
 
     # GEO — assess access, machine-readable identity, and useful extractable content.
@@ -698,7 +865,96 @@ def _run(A):
             "No internal homepage link with a commonly recognised about/service/product path was detected.",
             "Relevant internal pages can provide additional context about the business and its offer. Custom URL structures may not be recognised by this check.", [hurl])
 
+    # Many AI crawlers read the HTML without running JavaScript: compare that HTML with what the browser shows.
+    shown = hp["rendered"]["words"]
+    if shown >= 80 and raw["words"] < shown * 0.5:
+        sev = "high" if raw["words"] < shown * 0.2 else "medium"
+        add("geo", sev, "Much of the text only appears with JavaScript",
+            f"Visitors see about {shown} words, but the HTML sent to crawlers contains about {raw['words']}.",
+            "Many AI crawlers and some search tools do not run JavaScript, so text that is added in the browser may be invisible to them.", [hurl],
+            f"rendered={shown}; raw html={raw['words']}")
+    else:
+        ok("geo", "The main text is already in the HTML (readable without JavaScript)")
+
     S["geo"] = "done"
+
+    # Content: what a visitor actually reads. Text repeated on most pages (menu, footer, cookie banner) is not counted.
+    S["content"] = "running"
+    lines = {x: [l.strip() for l in r["rendered"]["text"].splitlines() if len(l.strip()) > 2] for x, r in rend.items()}
+    boiler = set()
+    if n >= 3:
+        seen = {}
+        for ls in lines.values():
+            for l in set(ls): seen[l] = seen.get(l, 0) + 1
+        boiler = {l for l, c in seen.items() if c >= max(2, 0.6 * n)}
+    main_words = {x: sum(len(l.split()) for l in ls if l not in boiler) for x, ls in lines.items()}
+    legal = re.compile(r"impressum|imprint|datenschutz|privacy|agb|terms|cookie|kontakt|contact|legal|mentions", re.I)
+    hw = main_words.get(hurl, 0)
+    if hw < 150:
+        add("content", "high", "The homepage says very little", f"Visitors see only about {hw} words of real content on the homepage (menu and footer not counted).",
+            "A homepage needs to explain what you offer, for whom, where and why to choose you. Short slogans and images alone "
+            "leave visitors and search engines guessing.", [hurl], f"main words={hw}")
+    elif hw < 300:
+        add("content", "medium", "Homepage content is thin", f"The homepage has about {hw} words of real content (menu and footer not counted).",
+            "More explanation of the offer, the audience and the benefits helps visitors decide and gives search engines more to work with.", [hurl])
+    else:
+        ok("content", f"The homepage has a reasonable amount of real content ({hw} words)")
+    content_pages = [x for x in pages if x != hurl and not legal.search(x)]
+    thin = [x for x in content_pages if main_words.get(x, 0) < 150]
+    if content_pages and len(thin) >= max(1, len(content_pages) / 2):
+        add("content", "high", "Most subpages are thin", f"{len(thin)} of {len(content_pages)} content pages have fewer than 150 words of their own content.",
+            "Pages with very little text rarely rank or convince visitors; each page should answer the questions its title raises.", thin,
+            json.dumps({x: main_words[x] for x in thin[:8]}))
+    elif thin:
+        add("content", "medium", "Some subpages are thin", f"{len(thin)} of {len(content_pages)} content pages have fewer than 150 words of their own content.",
+            "Pages with very little text rarely rank or convince visitors.", thin, json.dumps({x: main_words[x] for x in thin[:8]}))
+    elif content_pages:
+        ok("content", "Subpages have their own content")
+    placeholder = re.compile(r"lorem ipsum|dolor sit amet|i'?m a (?:paragraph|title)|add (?:your )?(?:paragraph|title) text|this is your "
+                             r"(?:about|blog|page)|click (?:here )?to edit|double click to edit|your (?:business|company) name|"
+                             r"ich bin ein (?:absatz|titel)|text hier einf\u00fcgen|hier klicken,? um", re.I)
+    ph = [x for x, r in rend.items() if placeholder.search(r["rendered"]["text"])]
+    if ph:
+        add("content", "high", "Template placeholder text is still online", f"{len(ph)} of {n} analysed pages still show template text such as 'Lorem ipsum' or 'I'm a paragraph'.",
+            "Placeholder text looks unfinished and immediately lowers trust.", ph,
+            json.dumps({x: placeholder.search(rend[x]["rendered"]["text"]).group(0) for x in ph[:5]}))
+    else:
+        ok("content", "No template placeholder text found")
+    dup = {}
+    for x in content_pages:
+        key = " ".join(l for l in lines[x] if l not in boiler)[:400].lower()
+        if len(key) > 60: dup.setdefault(key, []).append(x)
+    dups = [x for v in dup.values() if len(v) > 1 for x in v]
+    if dups:
+        add("content", "medium", "Pages repeat the same content", f"{len(dups)} of {n} analysed pages start with the same text as another page.",
+            "Duplicate pages compete with each other and give visitors nothing new.", dups)
+    elif len(content_pages) > 1:
+        ok("content", "Subpages have distinct content")
+    all_links = " ".join(urllib.parse.unquote(l).lower() for r in rend.values() for l in r["rendered"]["links"])
+    all_text = " ".join(r["rendered"]["text"].lower() for r in rend.values())
+    topics = [("About / team page", r"about|ueber-uns|uber-uns|\u00fcber-uns|team|qui-sommes|chi-siamo|tentang", "medium",
+               "Visitors want to know who is behind the business before they book or buy."),
+              ("Services / offer page", r"service|leistung|angebot|offer|kurs|klassen|class|course|produkt|product|treatment|behandlung|layanan", "medium",
+               "A page per service or offer explains what visitors get and gives search engines a page to rank for each topic."),
+              ("Prices", r"preis|price|pricing|tarif|kosten|cost|harga|prix|prezzi", "low",
+               "Clear prices (or a 'from' price) remove a common reason not to enquire."),
+              ("FAQ", r"faq|fragen|questions|haeufige|h\u00e4ufige|domande|pertanyaan", "low",
+               "Answers to common questions help visitors decide and are easy for AI-search systems to quote.")]
+    for label, rx, sev, why in topics:
+        if re.search(rx, all_links): ok("content", label + " found")
+        else: add("content", sev, label + " not found", f"No {label.lower()} was found in the links of the analysed pages.", why)
+    if re.search(r"testimonial|review|bewertung|kundenstimme|erfahrungsbericht|rezension|avis client|recensioni|ulasan|\u2605|google rating|trustpilot", all_text):
+        ok("content", "Reviews or testimonials are shown")
+    else:
+        add("content", "medium", "No reviews or testimonials found", "No reviews, testimonials or ratings were found on the analysed pages.",
+            "Feedback from real customers is one of the strongest trust signals for new visitors.")
+    years = [int(r["rendered"]["copyright"]) for r in rend.values() if r["rendered"]["copyright"]]
+    if years and max(years) < int(time.strftime("%Y")) - 1:
+        add("content", "low", "Copyright year looks outdated", f"The footer shows {max(years)}.",
+            "An old year makes the website look unmaintained.", [hurl])
+    elif years:
+        ok("content", "Copyright year is current")
+    S["content"] = "done"
 
     # Enquiry journey
     S["journey"] = "running"
@@ -716,11 +972,63 @@ def _run(A):
         add("journey", "low", "Limited descriptive link/button labels", "No link or button with a descriptive text label was extracted.", "Descriptive labels help visitors understand the next action and improve accessibility. This does not assess visual prominence or usability.", [hurl])
     if sum(d["forms"] for d in pages.values()): ok("journey", "An enquiry form was found")
     else: add("journey", "medium", "No form found on analysed pages", f"None of the {n} analysed pages contains a form.", "Forms are an easy way for visitors to enquire, though not the only one.")
+    contact_rx = re.compile(r"kontakt|contact|anfrage|enquir|inquir|hubungi|contatt", re.I)
+    if any(contact_rx.search(urllib.parse.unquote(x)) for x in hp["rendered"]["nav"]):
+        ok("journey", "The contact page is one click away in the menu")
+    else:
+        add("journey", "medium", "Contact page is not in the menu", "No contact page link was found in the header / navigation menu.",
+            "Visitors look for 'Contact' in the menu; if it is missing they have to search, and many give up.", [hurl])
+    contact_pages = [x for x in pages if contact_rx.search(urllib.parse.unquote(x))]
+    for x in contact_pages[:1]:
+        d = pages[x]
+        if d["forms"] or any(l.lower().startswith(("tel:", "mailto:")) for l in d["links"]):
+            ok("journey", "The contact page offers a form, a phone link or an email link")
+        else:
+            add("journey", "medium", "Contact page has no direct way to get in touch", "The contact page has no form and no clickable phone or email link.",
+                "A contact page should let visitors act immediately, not only read an address.", [x])
+    first = mob["rendered"]["first_screen"]
+    if any(any(c in f["label"] for c in CTA) or f["href"].lower().startswith(("tel:", "mailto:")) or "wa.me" in f["href"] or "whatsapp" in f["href"]
+           for f in first):
+        ok("journey", "A call to action is visible on the first screen on a phone")
+    else:
+        add("journey", "medium", "No call to action on the first phone screen", "On a phone-sized screen, no contact / booking button or link is visible before scrolling.",
+            "Most visitors arrive on a phone; if the next step is not visible straight away, many leave without acting.", [hurl],
+            json.dumps([f["label"] for f in first][:12], ensure_ascii=False))
+    offsite = sorted({urllib.parse.urlparse(l).hostname for r in rend.values() for l in r["rendered"]["links"]
+                      if urllib.parse.urlparse(l).scheme in ("http", "https") and host(l) != host(hurl)
+                      and re.search(r"book|calendar|termin|schedule|appointment|reserv|bsport|eversports|calendly|shop", l, re.I)})
+    if offsite:
+        add("journey", "low", "Booking or buying continues on another website", "Booking / scheduling links lead to: " + ", ".join(offsite[:4]) + ".",
+            "Switching to another website can feel unexpected; say clearly where the link goes, and make sure enquiries can be tracked.",
+            ev=", ".join(offsite))
+    m = mob["rendered"]
+    if m["overflow"]:
+        add("journey", "medium", "Page is wider than a phone screen", "On a phone-sized screen the homepage scrolls sideways.",
+            "Sideways scrolling makes text hard to read and buttons hard to reach on phones.", [hurl])
+    else:
+        ok("journey", "The homepage fits a phone screen")
+    if m["small_targets"] > 5:
+        add("journey", "low", "Small buttons and links on phones", f"{m['small_targets']} visible links or buttons are smaller than 32x32 pixels on a phone-sized screen.",
+            "Small tap targets are easy to miss with a finger.", [hurl])
+    if m["text_elements"] and m["tiny_text"] / m["text_elements"] > 0.2:
+        add("journey", "low", "Text is very small on phones", f"{m['tiny_text']} of {m['text_elements']} text elements use a font smaller than 12px on a phone.",
+            "Very small text is hard to read without zooming.", [hurl])
+    schema_phones = set()
+    for d in pages.values():
+        for blob in d["ld"]:
+            for tel in re.findall(r'"telephone"\s*:\s*"([^"]+)"', blob):
+                try: schema_phones.add(normalize_phone(tel, A.get("country")))
+                except ValueError: pass
+    country_checks(add, ok, A.get("country"), A.get("phone"), hd.get("lang"), [r["rendered"]["text"] for r in rend.values()],
+                   [l for r in rend.values() for l in r["rendered"]["links"]], hp["rendered"]["hreflang"], schema_phones)
     S["journey"] = "done"
 
     # Speed
-    slow = pg(lambda d: d["ms"] > 1500)
-    chk("speed", slow, "medium", "Slow server response", "took longer than 1.5 seconds to deliver the HTML", "Slow responses delay everything that follows.", "Pages respond quickly")
+    if home["ms"] > 1500: add("speed", "medium", "Slow server response", f"The server took {home['ms']} ms to deliver the homepage HTML.", "Slow responses delay everything that follows.", [hurl])
+    else: ok("speed", "The server responds quickly")
+    slow = [x for x, r in rend.items() if r["ms"] > 5000]
+    chk("speed", slow, "medium", "Pages load slowly in the browser", "took longer than 5 seconds to finish loading in the browser",
+        "Visitors wait for the full page; slow pages are left before they finish.", "Pages finish loading in the browser within 5 seconds")
     th.join(max(1, 75 - (time.time() - t0)))
     speed = None
     if "score" in psi:
@@ -743,12 +1051,12 @@ def _run(A):
     # Summary
     S["summary"] = "running"
     if js_shell:
-        notes.append("This page appears to build its content with JavaScript in the browser. This tool reads the HTML sent by the server, "
-                     "so content, headings and links added later may be missing and content-related findings may be overstated.")
+        notes.append("The HTML sent by the server is almost empty: this website builds its content with JavaScript. The browser "
+                     "audit sees the content, but crawlers that do not run JavaScript may not.")
     for f in A["customer"]:
         f["blocker"] = f["title"] in BLOCKERS and f["sev"] == "high"
     sc, caps = {}, {}
-    for c in ("seo", "geo", "journey", "speed"):
+    for c in CATS:
         issues = [x for x in A["customer"] if x["cat"] == c]
         weights = GEO_W if c == "geo" else W
         base = speed if c == "speed" else max(0, 100 - sum(weights[x["sev"]] for x in issues))
@@ -777,7 +1085,8 @@ def _run(A):
     limitations = [
         "GEO score measures technical/content readiness signals only; it does not measure actual visibility or citations in AI-generated answers.",
         "Automated checks cannot fully assess factual accuracy, content expertise, visual design, keyboard/screen-reader usability, conversion rate, or real visitor behaviour.",
-        "PageSpeed is measured for the homepage on mobile only. It is not a site-wide performance score."
+        "PageSpeed is measured for the homepage on mobile only. It is not a site-wide performance score.",
+        "Content checks count and compare text; they cannot judge whether the text is accurate, persuasive or well written."
     ]
     psi_seo = psi.get("lighthouse_seo")
     if psi_seo is not None:
@@ -789,13 +1098,13 @@ def _run(A):
         # Presentation only (does not change any score): open issues and passed checks per category.
         checks={c: dict(passed=sum(1 for x in A["passed"] if x["cat"] == c),
                         **{k: sum(1 for x in A["customer"] if x["cat"] == c and x["sev"] == k) for k in ("high", "medium", "low")})
-                for c in ("seo", "geo", "journey", "speed")},
+                for c in CATS},
         assessment_status=assessment, limitations=limitations,
-        coverage=dict(pages_analysed=n, pages_discovered=1, page_limit=1, notes=notes,
+        coverage=dict(pages_analysed=n, pages_discovered=A.get("pages_discovered", n), page_limit=MAX_PAGES, notes=notes,
                       speed=(f"Performance {speed}/100; LCP {psi['lcp']}, TBT {psi['tbt']}, CLS {psi['cls']}" if "score" in psi else None),
                       lighthouse_seo=psi_seo, speed_status="available" if not speed_missing else "unavailable"))
     S["summary"] = "done"
-    A.update(status="partial" if speed_missing else "completed", message="Your report is ready" if not speed_missing else "Report ready, but PageSpeed data is missing", pages_discovered=1)
+    A.update(status="partial" if speed_missing else "completed", message="Your report is ready" if not speed_missing else "Report ready, but PageSpeed data is missing")
 
 
 # ---------- HTTP ----------
@@ -832,6 +1141,8 @@ class H(BaseHTTPRequestHandler):
             A = AUDITS.get(m[1])
             return s.send(200, dict(url=A["url"], findings=A["internal"], passed=A["passed"])) if A else s.send(404, {"error": "not found"})
         if p in ("/health", "/api/health"): return s.send(200, {"ok": True})
+        if p == "/api/countries":  # the form's country list (with dial codes) comes from inputs.py, so both stay in sync
+            return s.send(200, [dict(code=k, name=v[0], dial=v[1]) for k, v in sorted(COUNTRIES.items(), key=lambda kv: kv[1][0])])
         if p in ("/", "/index.html"):  # local dev convenience; in production Netlify serves the page
             for d in (HERE, os.path.join(HERE, "..", "frontend")):
                 try: return s.send(200, open(os.path.join(d, "index.html"), "rb").read(), "text/html; charset=utf-8")
@@ -848,17 +1159,23 @@ class H(BaseHTTPRequestHandler):
         except Exception: return s.send(400, {"error": "Invalid request."})
         if d.get("hp"): return s.send(200, {"token": secrets.token_urlsafe(16)})  # honeypot
         name, email, raw = str(d.get("name", "")).strip()[:100], str(d.get("email", "")).strip()[:200], str(d.get("url", "")).strip()
+        country = str(d.get("country", "")).strip().upper()[:2]
         if not name or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or d.get("consent") is not True:
             return s.send(400, {"error": "Please complete all fields and accept the consent notice."})
-        url = raw if re.match(r"https?://", raw, re.I) else "https://" + raw
-        try: check(url)
-        except Exception: return s.send(400, {"error": "Please enter a valid, public website address."})
+        if country not in COUNTRIES and country != "XX":
+            return s.send(400, {"error": "Please select the country or area of the business."})
+        try: phone = normalize_phone(str(d.get("phone", ""))[:40], country)
+        except ValueError: return s.send(400, {"error": "Please enter a valid phone number (with the country code, e.g. +41 76 123 45 67)."})
+        try:
+            url, scheme_given = normalize_url(raw)
+            check(url)
+        except Exception: return s.send(400, {"error": "Please enter a valid, public website address, e.g. https://www.example.com, www.example.com or example.com."})
         HITS[ip].append(now)
         for k in [k for k, v in list(AUDITS.items()) if now - v.get("at", now) > KEEP_SECONDS]: AUDITS.pop(k, None)
         token = secrets.token_urlsafe(16)
-        A = AUDITS[token] = dict(url=url, status="queued", message="Waiting to start…", steps={k: "waiting" for k in STEPS},
+        A = AUDITS[token] = dict(url=url, scheme_given=scheme_given, phone=phone, country=country, status="queued", message="Waiting to start…", steps={k: "waiting" for k in STEPS},
                                  pages_discovered=0, pages_analysed=0, customer=[], internal=[], passed=[], report=None, at=now)
-        lead = dict(name=name, email=email, url=url, consent=True, at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        lead = dict(name=name, email=email, phone=phone, country=country, url=url, consent=True, at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         threading.Thread(target=deliver_lead, args=(lead,), daemon=True).start()
         threading.Thread(target=run, args=(A,), daemon=True).start()
         s.send(200, {"token": token})
