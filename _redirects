@@ -1,2 +1,0 @@
-# Replace YOUR-BACKEND-HOST with the public URL of the server running server.py
-/api/*  https://YOUR-BACKEND-HOST/api/:splat  200!
